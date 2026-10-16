@@ -30,11 +30,17 @@ let package = Package(
             resources: [
                 .process("Resources/Localizable.xcstrings"),
                 .copy("Resources/CustomSidebars"),
+                .copy("Resources/CustomSidebarTemplatePreviews"),
             ]
         ),
         .testTarget(
             name: "CmuxSettingsUITests",
-            dependencies: ["CmuxSettingsUI", "CmuxSettings"]
+            dependencies: [
+                "CMUXMobileCore",
+                "CmuxSettingsUI",
+                "CmuxSettings",
+                .product(name: "CmuxFoundation", package: "CmuxFoundation"),
+            ]
         ),
     ]
 )

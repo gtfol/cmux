@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { after } from "next/server";
 import type { VmRequestContext } from "../vms/requestContext";
 import type { VmErrorResponseInput } from "../vms/routeHelpers";
-import { cloudOperations, type CloudTelemetryClient, type CloudTelemetrySpan } from "./cloudTelemetryContract";
+import { cloudChannels, cloudOperations, type CloudTelemetryClient, type CloudTelemetrySpan } from "./cloudTelemetryContract";
 import { acceptCloudTelemetry } from "./cloudTelemetryRepository";
 import { drainCloudDiagnostics } from "./cloudTelemetryDelivery";
 
@@ -11,14 +11,13 @@ export function retainCloudServerError(input: VmErrorResponseInput, context: VmR
   if (!context?.userId || !context.traceId || !context.spanId) return;
   const now = Date.now();
   const rawChannel = context.client.channel;
-  const channel = rawChannel === "nightly" ? "nightly" : rawChannel === "stable" || rawChannel === "production" ? "production" : rawChannel === "dev" ? "dev" : "unknown";
+  const channel = rawChannel === "stable" ? "production" : cloudChannels.find((value) => value === rawChannel) ?? "unknown";
   const client: CloudTelemetryClient = {
     channel, version: safeVersion(context.client.version),
     build: context.client.build?.match(/^[0-9]{1,20}$/)?.[0] ?? "0",
     revision: context.client.revision ?? "unknown", osVersion: "0", architecture: "unknown",
   };
-  const operation = cloudOperations.includes(context.operation as CloudTelemetrySpan["operation"])
-    ? context.operation as CloudTelemetrySpan["operation"] : "unknown";
+  const operation = canonicalCloudTelemetryOperation(context.operation);
   const span: CloudTelemetrySpan = {
     eventId: randomUUID(), operationId: context.operationId ?? randomUUID(),
     traceId: context.traceId, spanId: context.spanId, operation, phase: "request",
@@ -31,7 +30,7 @@ export function retainCloudServerError(input: VmErrorResponseInput, context: VmR
   try {
     after(async () => {
       try {
-        await acceptCloudTelemetry(userId, { version: 1, client, spans: [span] }, code);
+        await acceptCloudTelemetry(userId, { version: 1, client, spans: [span] }, { serverErrorCode: code });
         await drainCloudDiagnostics();
       } catch {
         console.error("cmux.cloud.error_retention_failed", { code, trace_id: span.traceId });
@@ -40,6 +39,14 @@ export function retainCloudServerError(input: VmErrorResponseInput, context: VmR
   } catch {
     // Outside a web request, the caller's existing error sink remains responsible.
   }
+}
+
+/** Map route-specific operation names to the canonical Cloud telemetry catalog. */
+export function canonicalCloudTelemetryOperation(value: string | undefined): CloudTelemetrySpan["operation"] {
+  const canonical = value === "open_session" ? "open" : value;
+  return cloudOperations.includes(canonical as CloudTelemetrySpan["operation"])
+    ? canonical as CloudTelemetrySpan["operation"]
+    : "unknown";
 }
 
 function safeVersion(value: string | undefined): string {

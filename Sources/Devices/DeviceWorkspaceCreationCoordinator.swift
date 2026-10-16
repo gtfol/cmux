@@ -1,3 +1,5 @@
+import CmuxProductAnalytics
+import CmuxSurfaceCatalogModel
 import Foundation
 
 /// Shares device workspace creation between synchronous shortcut and menu actions.
@@ -21,6 +23,7 @@ final class DeviceWorkspaceCreationCoordinator {
             guard let manager else { return }
             do {
                 try await create(machine, manager)
+                ProductAnalytics.app.featureUsed(.devices)
             } catch is CancellationError {
                 throw CancellationError()
             } catch {

@@ -1,3 +1,5 @@
+import CmuxCloud
+import CmuxCloudTui
 import Foundation
 import Testing
 #if canImport(cmux_DEV)
@@ -28,7 +30,7 @@ import Testing
             do {
                 _ = try await command.value
                 Issue.record("a command deadline must fail the operation")
-            } catch CloudMachineLink.LinkError.timedOut {}
+            } catch CloudMachineLink.LinkError.requestTimedOut {}
         }
         let failed = try #require(recorder.operations.first)
         #expect(!failed.isRunning)
@@ -36,7 +38,7 @@ import Testing
         #expect(failed.failure == .timeout)
         #expect(failed.steps.first?.failure == .timeout)
         #expect(failed.isVisibleInMachinesPanel)
-        #expect(CloudTuiDaemonAnswer(error: CloudMachineLink.LinkError.timedOut).isRetryable)
+        #expect(CloudTuiDaemonAnswer(error: CloudMachineLink.LinkError.requestTimedOut).isRetryable)
 
         let success = recorder.begin(.workspace)
         await recorder.finish(success)

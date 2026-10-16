@@ -1,3 +1,5 @@
+import CmuxCloud
+import CmuxCloudTui
 import Foundation
 import Testing
 #if canImport(cmux_DEV)
@@ -26,7 +28,7 @@ import Testing
             do {
                 _ = try await command.value
                 Issue.record("a response delivered after resume cannot turn an expired request into success")
-            } catch CloudMachineLink.LinkError.timedOut {}
+            } catch CloudMachineLink.LinkError.requestTimedOut {}
 
             // An expired request never closes the machine-owned socket or replays work.
             async let sibling = channel.request(CloudTuiRequest("session.snapshot"))
@@ -66,7 +68,7 @@ import Testing
         do {
             _ = try await channel.request(CloudTuiRequest("session.ping"), timeout: timeout)
             Issue.record("an expired request must be rejected")
-        } catch CloudMachineLink.LinkError.timedOut {}
+        } catch CloudMachineLink.LinkError.requestTimedOut {}
         await channel.close()
     }
 }

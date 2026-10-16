@@ -1,5 +1,6 @@
 import AppKit
 import CmuxSettings
+import CmuxSurfaceCatalogModel
 import Foundation
 import Testing
 
@@ -22,16 +23,39 @@ final class CloudWorkspaceCreationSidebarFixture {
     let originalWorkspaceID: UUID
     private let defaults: UserDefaults
     private let defaultsName = "cloud-workspace-creation-\(UUID().uuidString)"
+    private let previousSharedRenameService: CloudWorkspaceRenameService?
+    private let cloudOptIn: CloudMachinesOptInForTesting?
 
-    init() throws {
+    /// - Parameter enablesCloudMachines: Holds the Cloud opt-in on for tests
+    ///   that press a Cloud creation action, which otherwise shows the welcome.
+    init(useSharedCatalog: Bool = false, machine: SurfaceMachineID? = nil, enablesCloudMachines: Bool = false) throws {
+        cloudOptIn = enablesCloudMachines ? CloudMachinesOptInForTesting() : nil
         defaults = try #require(UserDefaults(suiteName: defaultsName))
         manager = TabManager(autoWelcomeIfNeeded: false, settings: UserDefaultsSettingsClient(defaults: defaults))
         originalWorkspaceID = try #require(manager.selectedTabId)
         let owner = manager
-        catalog = SurfaceCatalog(cloudWorkspaceRenameService: CloudWorkspaceRenameService(environment: .init(
+        let ownerEnvironment = CloudWorkspaceRenameEnvironment(
             workspace: { owner.workspacesById[$0] }, tabManager: { _ in owner }, workspaces: { owner.tabs }
-        )))
-        provider = CloudWorkspaceCreationSidebarProvider(catalog: catalog)
+        )
+        if useSharedCatalog {
+            // The shared catalog's rename service was installed by the host
+            // app delegate and resolves workspaces through that delegate's
+            // windows, which never contain this fixture's manager. Without
+            // this, bindCloudWorkspace is a no-op and reservations never get
+            // their cloudVMBinding.
+            let shared = SurfaceCatalog.shared
+            previousSharedRenameService = shared.cloudWorkspaceRenameService
+            shared.installCloudWorkspaceRenameService(CloudWorkspaceRenameService(environment: ownerEnvironment))
+            catalog = shared
+        } else {
+            previousSharedRenameService = nil
+            catalog = SurfaceCatalog(cloudWorkspaceRenameService: CloudWorkspaceRenameService(environment: ownerEnvironment))
+        }
+        if let machine {
+            provider = CloudWorkspaceCreationSidebarProvider(catalog: catalog, machine: machine)
+        } else {
+            provider = CloudWorkspaceCreationSidebarProvider(catalog: catalog)
+        }
         window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 640, height: 480),
                           styleMask: [.titled, .closable], backing: .buffered, defer: false)
         window.isReleasedWhenClosed = false
@@ -66,8 +90,12 @@ final class CloudWorkspaceCreationSidebarFixture {
         manager.tabs.forEach { $0.teardownAllPanels() }
         app.unregisterMainWindowContextForTesting(windowId: windowID)
         window.close()
+        if let previousSharedRenameService {
+            catalog.installCloudWorkspaceRenameService(previousSharedRenameService)
+        }
         AppDelegate.shared = previousApp
         TerminalController.shared.setActiveTabManager(previousManager)
         defaults.removePersistentDomain(forName: defaultsName)
+        cloudOptIn?.restore()
     }
 }

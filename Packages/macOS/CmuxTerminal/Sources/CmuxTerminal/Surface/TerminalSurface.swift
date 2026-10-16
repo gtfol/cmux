@@ -20,6 +20,11 @@ internal import CMUXDebugLog
 /// stored properties are unannotated (the class itself is not `Sendable`, so
 /// they never cross an isolation boundary) which keeps the nonisolated
 /// `deinit` teardown path exactly as it was.
+struct TerminalSurfacePendingRemoteReplayCompletion: Sendable {
+    let applied: @MainActor @Sendable () -> Void
+    let discarded: @MainActor @Sendable () -> Void
+}
+
 public final class TerminalSurface: Identifiable, ObservableObject {
     static let committedTextInputChunkByteLimit = 96
 
@@ -185,16 +190,13 @@ public final class TerminalSurface: Identifiable, ObservableObject {
     /// The tmux bootstrap command captured for respawn, if any.
     public let tmuxStartCommand: String?
 
-    /// Text written to the surface immediately after the first spawn, if any.
+    /// Startup text retained until the shell reports readiness.
     public let initialInput: String?
     var nextRuntimeInitialInput: String?
+    var startupInputGate = TerminalStartupInputGate()
     /// When true, a deferred restore was cancelled before its first runtime.
-    /// This suppresses the construction-time startup payload while retaining
-    /// the configured values for persistence/debug inspection.
+    /// Suppresses the payload while retaining its persistence/debug configuration.
     var suppressConfiguredInitialInput = false
-    /// The command to use when a deferred restore is cancelled, if it needs to
-    /// keep a transport attach alive without running the resume payload.
-    var startupRestoreAdmissionFallbackCommand: String?
     var startupRestoreAdmissionCommandOverride: String?
     var hasStartupRestoreAdmissionCommandOverride = false
     let initialEnvironmentOverrides: [String: String]
@@ -215,6 +217,85 @@ public final class TerminalSurface: Identifiable, ObservableObject {
 
     /// Identifies who owns the process, PTY, and terminal protocol.
     public let ioMode: TerminalSurfaceIOMode
+    /// Whether the process or PTY is supplied by a remote SSH/Cloud transport.
+    /// Remote exec terminals still use ``ioMode`` ``.exec`` because Ghostty
+    /// owns their local PTY, so protocol callbacks need this origin bit too.
+    public let isRemoteTerminal: Bool
+    /// Whether OSC 52 may publish into the local clipboard without a gesture.
+    /// Manual mirrors and remote exec PTYs are untrusted unless the Cloud
+    /// provider grants its write-only clipboard path.
+    public var allowsAutomaticClipboardWrite: Bool {
+        (!ioMode.usesManualIO && !isRemoteTerminal) || allowsRemoteClipboardWrites
+    }
+    // The Ghostty clipboard callback is synchronous and may run off-main; this
+    // short lock protects the compare-and-consume of a pending selection transaction.
+    private let clipboardWritePermitLock = NSLock()
+    private struct ClipboardWriteTransaction {
+        let deadline: UInt64
+        var remainingWrites: UInt8
+    }
+    private var clipboardWriteTransaction: ClipboardWriteTransaction?
+
+    /// Arms a bounded transaction for asynchronous writes caused by one pointer selection.
+    ///
+    /// A triple-click produces a word write followed by a line write, so the
+    /// caller may reserve more than one callback for the same gesture. The
+    /// transaction is replaced by a newer gesture and never accumulates stale
+    /// writes from an earlier selection.
+    ///
+    /// - Parameter writeCount: Number of non-empty callbacks this gesture may
+    ///   produce, clamped to the supported range of one through three.
+    public func permitClipboardWriteForUserGesture(writeCount: Int = 1) {
+        clipboardWritePermitLock.lock()
+        defer { clipboardWritePermitLock.unlock() }
+        clipboardWriteTransaction = ClipboardWriteTransaction(
+            deadline: DispatchTime.now().uptimeNanoseconds + 15_000_000_000,
+            remainingWrites: UInt8(max(1, min(writeCount, 3)))
+        )
+    }
+
+    /// Consumes one callback from the pending pointer-selection transaction.
+    public func consumeClipboardWritePermit() -> Bool {
+        clipboardWritePermitLock.lock()
+        defer { clipboardWritePermitLock.unlock() }
+        guard var transaction = clipboardWriteTransaction,
+              DispatchTime.now().uptimeNanoseconds <= transaction.deadline else {
+            clipboardWriteTransaction = nil
+            return false
+        }
+        transaction.remainingWrites -= 1
+        clipboardWriteTransaction = transaction.remainingWrites == 0 ? nil : transaction
+        return true
+    }
+
+    /// Returns whether a non-empty callback may write this surface's clipboard.
+    ///
+    /// Automatic writes remain governed by the surface trust policy. Manual
+    /// mirrors additionally require a user copy running on this call stack
+    /// (Cmd+C, Edit > Copy, keyboard copy mode) or a pending user-selection
+    /// transaction.
+    ///
+    /// - Parameter contentLength: Number of bytes in the callback payload.
+    /// - Returns: Whether the callback is admitted.
+    public func permitsClipboardWrite(contentLength: Int) -> Bool {
+        guard contentLength > 0 else { return false }
+        if allowsAutomaticClipboardWrite { return true }
+        guard ioMode == .manualMirror else { return false }
+        if surfaceCallbackContext?.takeUnretainedValue().hasUserInitiatedClipboardWriteIntent == true {
+            return true
+        }
+        return consumeClipboardWritePermit()
+    }
+
+    /// Cancels a pending pointer-selection clipboard permit.
+    public func cancelClipboardWritePermit() {
+        clipboardWritePermitLock.lock()
+        clipboardWriteTransaction = nil
+        clipboardWritePermitLock.unlock()
+    }
+    /// Cloud-only permission for guest clipboard writer shims. Clipboard reads
+    /// remain denied by the runtime policy regardless of this flag.
+    public let allowsRemoteClipboardWrites: Bool
     /// Ordered input from the manual transport (literal bytes or named keys).
     let manualInputHandler: (@Sendable (TerminalManualInput) -> Void)?
     /// Resolves physical keys that the manual transport should encode itself.
@@ -234,8 +315,26 @@ public final class TerminalSurface: Identifiable, ObservableObject {
     @MainActor public var onManualVisibilityChanged: (@MainActor (Bool) -> Void)?
     /// Requests owner-scoped visual bell attention without activating the app.
     @MainActor public var onVisualBell: (@MainActor () -> Void)?
+    /// Called when the pane's natural grid may have changed: its own
+    /// (uncapped) pixel size or its cell size (a font-size change) changed.
+    /// A shared-sizing host uses it to re-report the Mac pane's grid as a
+    /// participant viewport.
+    @MainActor public var onNaturalGridInputsChanged: (@MainActor () -> Void)?
+
+    /// Reports a cell-size change (the font size changed), which changes the
+    /// natural grid without changing the pane's pixel size.
+    @MainActor public func cellSizeDidChange() {
+        // A pin fixes pixels from the old cell size; recompute them so the
+        // assigned grid survives a font change.
+        if assignedGrid != nil { reapplyAssignedGrid() }
+        onNaturalGridInputsChanged?()
+    }
     /// Routes accepted explicit user input to the surface's current panel owner.
     @MainActor public var onExplicitInput: (@MainActor () -> Void)?
+    /// Set while another participant disconnected this pane's view of a
+    /// shared terminal (docs/shared-terminal-sizing.md). The pane drops
+    /// keyboard and text input until the user reattaches.
+    @MainActor public var sharingViewDetached = false
     /// Notifies the owner when explicit input cancels a deferred auto-resume.
     @MainActor public var onStartupRestoreAdmissionCancelled: (@MainActor () -> Void)?
     /// Called after durable font-size lineage changes.
@@ -253,6 +352,11 @@ public final class TerminalSurface: Identifiable, ObservableObject {
     /// Output delivered before the runtime surface exists. Flushed once the
     /// surface is created so background mirror output is not lost.
     var pendingRemoteOutput = Data()
+    /// Completion callbacks for replacement replays buffered with
+    /// ``pendingRemoteOutput``. They must run after the buffered bytes have
+    /// crossed the native output lane, otherwise replay-fidelity tracking can
+    /// race runtime creation and trigger an unnecessary reconnect.
+    var pendingRemoteReplayCompletions: [TerminalSurfacePendingRemoteReplayCompletion] = []
     let maxPendingRemoteOutputBytes = 4 * 1_048_576
     /// FIFO native-output lane for the current runtime surface generation.
     var remoteOutputLane: TerminalSurfaceRemoteOutputLane
@@ -331,6 +435,10 @@ public final class TerminalSurface: Identifiable, ObservableObject {
         TerminalSurfaceRuntimeTeardownReservation?
     var headlessStartupWindow: NSWindow?
     var surfaceCallbackContext: Unmanaged<GhosttySurfaceCallbackContext>?
+    /// Ghostty's renderer layer for the live runtime surface. Every free path
+    /// takes it and detaches its display callback on the main actor before
+    /// the native free (#17483).
+    var runtimeDisplayLayer: TerminalSurfaceRuntimeDisplayLayer?
     var agentCommandShims: AgentCommandShimSet?
     var agentCommandShimSpawnPolicy: TerminalSurfaceSpawnPolicy?
     var agentCommandShimInstallTask: Task<AgentCommandShimSet?, Never>?
@@ -377,6 +485,7 @@ public final class TerminalSurface: Identifiable, ObservableObject {
     // Same off-isolation-reader carve-out as debugMetadataLock.
     let debugForceRefreshCountLock = NSLock()
     var debugForceRefreshCountValue = 0
+    var debugForceRefreshReasonsValue: [String] = []
     /// Test-only override for the native free used by teardown paths.
     // nonisolated(unsafe) so the nonisolated deinit teardown path can read it,
     // like the @MainActor teardownSurface/suspend paths already do; tests only
@@ -551,6 +660,8 @@ public final class TerminalSurface: Identifiable, ObservableObject {
         additionalEnvironment: [String: String] = [:],
         focusPlacement: TerminalSurfaceFocusPlacement = .workspace,
         ioMode: TerminalSurfaceIOMode = .exec,
+        isRemoteTerminal: Bool = false,
+        allowsRemoteClipboardWrites: Bool = false,
         manualInputHandler: (@Sendable (TerminalManualInput) -> Void)? = nil,
         manualInputKeyNameResolver: (@MainActor @Sendable (ghostty_input_key_s) -> String?)? = nil,
         runtimeSpawnPolicy: TerminalSurfaceRuntimeSpawnPolicy = .immediate,
@@ -588,6 +699,8 @@ public final class TerminalSurface: Identifiable, ObservableObject {
         self.additionalEnvironment = Self.mergedNormalizedEnvironment(base: [:], overrides: additionalEnvironment)
         self.focusPlacement = focusPlacement
         self.ioMode = ioMode
+        self.isRemoteTerminal = isRemoteTerminal
+        self.allowsRemoteClipboardWrites = allowsRemoteClipboardWrites
         self.manualInputHandler = manualInputHandler
         self.manualInputKeyNameResolver = manualInputKeyNameResolver
         self.registry = dependencies.registry
@@ -690,6 +803,16 @@ public final class TerminalSurface: Identifiable, ObservableObject {
         agentCommandShimCompletionTask?.cancel()
         retireSurfaceRegistryRegistrationIfNeeded()
         markPortalLifecycleClosed(reason: "deinit")
+        // Mirror teardownSurface: release an unconsumed agent-hibernation
+        // reservation so the bounded slot is not stranded (#15652). The
+        // admission state is main-actor isolated and deinit is not.
+        if let hibernationReservation = agentHibernationRuntimeTeardownReservation {
+            agentHibernationRuntimeTeardownReservation = nil
+            let coordinator = runtimeTeardown
+            Task { @MainActor in
+                coordinator.cancelIsolatedHibernationTeardown(hibernationReservation)
+            }
+        }
         // Mirror closeHeadlessStartupWindowIfNeeded: deinit is nonisolated, so
         // the NSWindow teardown hops to the main actor through the same kind of
         // @unchecked Sendable transport the runtime teardown request uses. The
@@ -715,6 +838,10 @@ public final class TerminalSurface: Identifiable, ObservableObject {
         // mobileByteTeeLease, so teeLease is nil here and ?.release() no-ops.
         let teeLease = mobileByteTeeLease
         mobileByteTeeLease = nil
+        // Deinit is nonisolated; the coordinator detaches the layer's display
+        // callback on the main actor before it schedules the native free.
+        let displayLayer = runtimeDisplayLayer
+        runtimeDisplayLayer = nil
         // `dropSurface` is @MainActor but `deinit` is nonisolated, so hop to the
         // main actor with the surface id captured by value (no self capture).
         // Dropping by id only clears the registry/replay state; releasing
@@ -781,6 +908,7 @@ public final class TerminalSurface: Identifiable, ObservableObject {
                 callbackContext: callbackContext,
                 manualIOContext: manualIOContext,
                 byteTeeLease: teeLease,
+                displayLayer: displayLayer,
                 beforeFree: {
                     await retiredRemoteOutputLane.drain()
                 },
@@ -797,6 +925,7 @@ public final class TerminalSurface: Identifiable, ObservableObject {
             callbackContext: callbackContext,
             manualIOContext: manualIOContext,
             byteTeeLease: teeLease,
+            displayLayer: displayLayer,
             beforeFree: {
                 await retiredRemoteOutputLane.drain()
             }

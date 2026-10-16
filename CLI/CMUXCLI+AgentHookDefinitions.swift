@@ -105,6 +105,16 @@ extension CMUXCLI {
             case codexConfigToml // write hooks = true to config.toml on install, remove on uninstall
         }
 
+        /// Whether `resolvedConfigDir()` comes from a non-empty env override.
+        var resolvesConfigDirFromEnvOverride: Bool {
+            guard configDirResolver == nil,
+                  let envKey = configDirEnvOverride,
+                  let value = ProcessInfo.processInfo.environment[envKey] else {
+                return false
+            }
+            return !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+
         /// Resolves the config directory, respecting env override if set.
         func resolvedConfigDir() -> String {
             if let configDirResolver {
@@ -227,7 +237,48 @@ extension CMUXCLI {
                 materialize: materializeCodexScripts
             )
         }
+        if def.name == "muse" {
+            return museHookScriptCommand(
+                inline,
+                eventTag: event.cmuxSubcommand,
+                materialize: materializeCodexScripts
+            )
+        }
         return inline
+    }
+
+    /// Muse runs a hook command with the user's login shell (`$SHELL -c`), so
+    /// fish and nushell users cannot parse the POSIX dispatch inline. The
+    /// dispatch is written to a cmux-owned `#!/bin/sh` script, and the installed
+    /// command is just that path plus the owned-hook marker, which every shell
+    /// runs. Falls back to the inline command if the script cannot be written
+    /// or its path cannot be quoted the same way in every shell.
+    private static func museHookScriptCommand(
+        _ inlineCommand: String,
+        eventTag: String,
+        materialize: Bool
+    ) -> String {
+        guard materialize,
+              let dir = museHookScriptsDirectory(),
+              let path = writeCodexHookScript(
+                  subcommand: "muse-\(eventTag)", body: inlineCommand, in: dir
+              ),
+              !path.contains("'"), !path.contains("\\") else {
+            return inlineCommand
+        }
+        return "'\(path)' \(musePinnedHookMarker) \(eventTag)"
+    }
+
+    /// Muse hook scripts live in their own subdirectory: Codex garbage-collects
+    /// unreferenced content-addressed scripts directly under `~/.cmux/hooks`.
+    private static func museHookScriptsDirectory() -> URL? {
+        let dir = codexHookScriptsURL().appendingPathComponent("muse", isDirectory: true)
+        do {
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            return dir
+        } catch {
+            return nil
+        }
     }
 
     /// Wraps a codex persistent hook command as a `#!/bin/sh` script file in the
@@ -332,6 +383,7 @@ extension CMUXCLI {
 
     private static let grokPinnedHookMarker = "cmux-grok-hook-v2"
     private static let antigravityPinnedHookMarker = "cmux-antigravity-hook-v2"
+    static let musePinnedHookMarker = "cmux-muse-hook-v1"
 
     static func agentHookShellCommand(
         _ command: String,
@@ -360,9 +412,10 @@ extension CMUXCLI {
     /// inherited `CMUX_CODEX_PID` as its own owner identity.
     static func codexSynchronousAgentHookShellCommand(
         _ command: String,
-        for def: AgentHookDef
+        for def: AgentHookDef,
+        failOpen: Bool = false
     ) -> String {
-        let dispatch = agentHookShellCommand(command, for: def)
+        let dispatch = agentHookShellCommand(command, for: def, failOpen: failOpen)
         return "CMUX_CODEX_HOOK_PID=\"${PPID:-}\"; export CMUX_CODEX_HOOK_PID; \(dispatch)"
     }
 
@@ -377,11 +430,15 @@ extension CMUXCLI {
     }
 
     static func usesPinnedHookDispatch(_ def: AgentHookDef) -> Bool {
-        def.name == "grok" || def.name == "antigravity"
+        def.name == "grok" || def.name == "antigravity" || def.name == "muse"
     }
 
     private static func pinnedHookMarker(for def: AgentHookDef) -> String {
-        def.name == "antigravity" ? antigravityPinnedHookMarker : grokPinnedHookMarker
+        switch def.name {
+        case "antigravity": return antigravityPinnedHookMarker
+        case "muse": return musePinnedHookMarker
+        default: return grokPinnedHookMarker
+        }
     }
 
     private static func pinnedAgentHookShellCommand(
@@ -561,7 +618,11 @@ extension CMUXCLI {
         let socket = shellSingleQuote(socketPath.map { URL(fileURLWithPath: $0).lastPathComponent } ?? "nil")
         let statusField = statusExpression == nil ? "" : " status=%s"
         let statusArgument = statusExpression.map { " \($0)" } ?? ""
-        return "printf '%s \(agentName)Hook.shell phase=%s event=%s pid=%s ppid=%s socket=%s\(statusField)\\n' \"$(date +%s)\" \(shellSingleQuote(phase)) \(event) \"$$\" \"${PPID:-}\" \(socket)\(statusArgument) >> \(logPath) 2>/dev/null || true"
+        // Any local account can create names in /tmp, so append only to an
+        // existing regular file this user owns with a single link, never
+        // through a symlink or into a file someone else prepared.
+        let ownedLogCheck = "[ -n \"$(find \(logPath) -prune -type f -links 1 -user \"$(id -u)\" 2>/dev/null)\" ]"
+        return "\(ownedLogCheck) && printf '%s \(agentName)Hook.shell phase=%s event=%s pid=%s ppid=%s socket=%s\(statusField)\\n' \"$(date +%s)\" \(shellSingleQuote(phase)) \(event) \"$$\" \"${PPID:-}\" \(socket)\(statusArgument) >> \(logPath) 2>/dev/null || true"
 #else
         return ":"
 #endif

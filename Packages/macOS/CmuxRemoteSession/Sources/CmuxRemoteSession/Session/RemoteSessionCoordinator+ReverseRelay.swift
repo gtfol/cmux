@@ -226,8 +226,35 @@ extension RemoteSessionCoordinator {
         guard let remotePath = daemonRemotePath,
               !remotePath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
 
-        let detail = stderrDetail ?? "status=\(process.terminationStatus)"
-        debugLog("remote.relay.exit \(detail)")
+        if let authenticationFailure = stderrDetail.flatMap(
+            RemoteRelayAuthenticationFailure.detect(in:)
+        ) {
+            debugLog(
+                "remote.relay.authFailed kind=\(authenticationFailure.logLabel) " +
+                    "status=\(process.terminationStatus)"
+            )
+            let detail = String(
+                localized: "remoteSession.parked.sshAuthenticationFailed",
+                defaultValue: "SSH authentication failed. Automatic reconnect paused; use Reconnect to try again."
+            )
+            resetTransportForReconnectLocked(
+                preservePersistentRelayMetadata: true
+            )
+            parkSessionLocked(
+                cause: .sshAuthenticationFailed,
+                daemonState: .error,
+                detail: detail
+            )
+            return
+        }
+
+        // Stderr can contain ProxyCommand output, hostnames, usernames, or
+        // other caller-controlled secrets. Keep it out of logs and publish
+        // only the existing retry state for failures we do not classify.
+        debugLog(
+            "remote.relay.exit status=\(process.terminationStatus) " +
+                "detailAvailable=\(stderrDetail == nil ? 0 : 1)"
+        )
         publishReverseRelayFailureLocked(remotePath: remotePath)
     }
 
@@ -315,12 +342,16 @@ extension RemoteSessionCoordinator {
         // Fallback only: `-S none` prevents accidental adoption of a shared
         // transport after `-O forward` proved unavailable.
         var args: [String] = ["-N", "-T", "-S", "none", "-v"]
-        args += sshCommonArguments(batchMode: true, dropControlPath: true)
+        args += sshCommonArguments(
+            batchMode: true,
+            dropControlPath: true,
+            batchForwarding: .agentAndX11Off
+        )
         args += [
             "-o", "ExitOnForwardFailure=yes",
             "-o", "RequestTTY=no",
             "-R", "127.0.0.1:\(relayPort):127.0.0.1:\(localRelayPort)",
-            configuration.destination,
+            "--", configuration.destination,
         ]
         return args
     }
@@ -362,13 +393,14 @@ extension RemoteSessionCoordinator {
             relayPort: relayPort,
             relayID: relayID,
             relayToken: relayToken,
-            persistentDaemonSlot: configuration.persistentDaemonSlot
+            persistentDaemonSlot: configuration.persistentDaemonSlot,
+            codexWrapperScript: codexWrapperScript
         )
         // Relay credentials are deliberately stored on the remote host, so
         // never place the token-bearing script in SSH argv (argv is visible to
         // other users and is retained in debug command logs). Feed it to
         // `sh -s` over stdin instead.
-        let arguments = sshCommonArguments(batchMode: true) + [configuration.destination, "sh -s"]
+        let arguments = sshCommonArguments(batchMode: true) + ["--", configuration.destination, "sh -s"]
         let result = try sshExec(
             arguments: arguments,
             stdin: Data(script.utf8),
@@ -440,7 +472,7 @@ extension RemoteSessionCoordinator {
         let command = "sh -c \(script.shellSingleQuoted)"
         do {
             let result = try sshExec(
-                arguments: sshCommonArguments(batchMode: true) + [configuration.destination, command],
+                arguments: sshCommonArguments(batchMode: true) + ["--", configuration.destination, command],
                 timeout: 8
             )
             if result.status == 64, let status64FallbackScript {

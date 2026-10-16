@@ -1,3 +1,4 @@
+import CmuxCloud
 import AppKit
 import Foundation
 
@@ -116,7 +117,8 @@ extension AppDelegate {
             return CmuxFeatureFlags.shared.isSimulatorEnabled
         case .mobileConnect:
             return !MobileRemoteControlPolicy.isDisabled
-        case .newWorkspace, .newTerminal, .splitRight, .splitDown:
+        case .newWorkspace, .newTerminal, .splitRight, .splitDown,
+             .copyWorkingDirectory, .copyProjectRoot, .copyScreen:
             return true
         }
     }
@@ -166,7 +168,17 @@ extension AppDelegate {
             NSSound.beep()
             return
         }
-        guard executeConfiguredCmuxAction(box.action, context: context, preferredWindow: window) else {
+        let didExecute: Bool
+        if case .builtIn(.newWorkspace) = box.action.action {
+            didExecute = performNewWorkspaceAction(
+                tabManager: context.tabManager,
+                debugSource: "newWorkspace.contextMenu",
+                skipConfiguredAction: true
+            )
+        } else {
+            didExecute = executeConfiguredCmuxAction(box.action, context: context, preferredWindow: window)
+        }
+        guard didExecute else {
             NSSound.beep()
             return
         }

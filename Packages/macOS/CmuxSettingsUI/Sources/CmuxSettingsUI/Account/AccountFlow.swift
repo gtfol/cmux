@@ -1,3 +1,4 @@
+import CMUXMobileCore
 import Foundation
 
 /// Host-supplied dependency the package's ``AccountSection`` uses to
@@ -12,7 +13,7 @@ import Foundation
 /// `currentIdentity` / `availableTeams` / `selectedTeamID` from view
 /// bodies. Use `@Observable` so SwiftUI tracks changes.
 @MainActor
-public protocol AccountFlow: AnyObject {
+public protocol AccountFlow: AccountTeamManagement {
     /// The currently signed-in user, or `nil` if signed out.
     var currentIdentity: AccountIdentity? { get }
 
@@ -74,13 +75,17 @@ public protocol AccountFlow: AnyObject {
     /// Opens the hosted Stripe customer portal in the user's default browser.
     func openBillingPortal()
 
-    /// Whether the Pro upgrade row should render. The host backs this with
-    /// a remotely toggleable feature flag; `true` when flags are
-    /// unavailable only in explicit dogfood builds whose flag default is on.
+    /// Whether the Settings plan row should render. The row chooses its
+    /// copy and actions from ``planTier``.
     var isProUpgradeAvailable: Bool { get }
 
-    /// Whether the current account has an active Pro entitlement.
+    /// Whether the current account has an active paid Cloud entitlement.
     var isProActive: Bool { get }
+
+    /// The signed-in account's plan tier, or `nil` while it is unknown.
+    /// Defaults to Pro or Free from ``isProActive`` for hosts that only
+    /// know the legacy flag.
+    var planTier: CmuxPlanTier? { get }
 
     /// Whether the current Pro entitlement can be managed through the hosted
     /// Stripe billing portal.
@@ -89,4 +94,6 @@ public protocol AccountFlow: AnyObject {
 
 extension AccountFlow {
     public func prefetchProUpgrade() {}
+
+    public var planTier: CmuxPlanTier? { isProActive ? .pro : nil }
 }

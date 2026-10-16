@@ -1,3 +1,4 @@
+import CmuxCloud
 import CmuxFoundation
 import CmuxCloudMachines
 import CmuxSettings
@@ -35,6 +36,9 @@ final class CloudVMActionLauncher {
         /// cancelled create is not a failed create and must not present an
         /// error sheet or notification.
         var wasCancelled: Bool = false
+        /// The server's refusal code, read from the error the request threw
+        /// (in process) or the CLI's own error header; never from a message.
+        var refusalCode: String? = nil
 
         var succeeded: Bool {
             terminationStatus == 0
@@ -231,27 +235,25 @@ final class CloudVMActionLauncher {
 
     /// Best-effort cleanup for a machine that was announced by a cancelled
     /// create. Delete is idempotent at the socket boundary, so a race with the
-    /// create finalizer is safe; the local workspace/catalog cleanup is handled
-    /// by the same destroy path as a user-initiated delete. The auth-transition
-    /// override keeps a late tombstone from opening a sign-in sheet; the socket
-    /// still enforces the account's server-side authorization.
+    /// create finalizer is safe. The machine hides at once, and its local
+    /// workspaces and panes detach when the destroy request starts. The
+    /// auth-transition override keeps a late tombstone from opening a sign-in
+    /// sheet; the socket still enforces the account's server-side authorization.
     func destroyMachineBestEffort(_ machineID: String) {
         let id = machineID.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !id.isEmpty else { return }
+        guard MachineDeleteCoordinator.shared.canBegin(id) else { return }
         let socketPath = TerminalController.shared.activeSocketPath(
             preferredPath: SocketControlSettings.socketPath()
         )
-        _ = start(
+        // The socket's destroy retires the machine; an early CLI exit lists it again.
+        if start(
             socketPath: socketPath,
             preferredWindow: nil,
             arguments: ["vm", "rm", id],
             presentsFailureAlert: false,
             allowDuringAuthTransition: true,
-            onCompletion: { completion in
-                guard completion.succeeded || completion.indicatesCloudVMNotFound else { return }
-                AppDelegate.shared?.closeWorkspaces(forManagedCloudVMID: id)
-            }
-        )
+            onCompletion: { _ in MachineDeleteCoordinator.shared.launchEnded(id) }
+        ) { MachineDeleteCoordinator.shared.beginCleanup(id) }
     }
 
     @discardableResult
@@ -313,6 +315,10 @@ final class CloudVMActionLauncher {
         var environment = ProcessInfo.processInfo.environment
         environment["CMUX_SOCKET_PATH"] = socketPath
         environment["CMUX_BUNDLED_CLI_PATH"] = cliURL.path
+        // The app launches these for a person's click, so the CLI's opens take focus the
+        // way an interactive run does (its piped stdio would otherwise read as a
+        // script). A background launch passes `--focus false`, which still wins.
+        environment["CMUX_FOCUS_NEW"] = "1"
         for (key, value) in environmentOverrides {
             environment[key] = value
         }
@@ -349,7 +355,8 @@ final class CloudVMActionLauncher {
                     output: output,
                     workspaceId: Self.createdWorkspaceId(from: output),
                     machineId: Self.createdMachineId(from: output),
-                    wasCancelled: wasCancelled
+                    wasCancelled: wasCancelled,
+                    refusalCode: terminationStatus == 0 ? nil : CloudPlanRefusal.code(inCLIFailureOutput: output)
                 )
                 if let operationContext {
                     let diagnosticError: Error? = wasCancelled ? CancellationError()
@@ -518,6 +525,16 @@ final class CloudVMActionLauncher {
             localized: "command.cloudVM.failed.details.hidden",
             defaultValue: "Additional technical details are available in logs."
         )
+    }
+
+    /// The sentence a person sees for a Cloud failure: the server's explained
+    /// refusal when it named one, else the class label. A server sentence the
+    /// output redaction would hide falls back to the class label too.
+    nonisolated static func displayableFailureMessage(for error: Error) -> String {
+        let message = CloudDiagnosticFailure.message(for: error)
+        let safe = sanitizedCloudVMStartOutput(message)
+        guard safe.isEmpty || safe == hiddenOutputPlaceholder else { return message }
+        return CloudDiagnosticFailure.classify(error).label
     }
 
     /// The first line of CLI output that passes the same redaction as the full

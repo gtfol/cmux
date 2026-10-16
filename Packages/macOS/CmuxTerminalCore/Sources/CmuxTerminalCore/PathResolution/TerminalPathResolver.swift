@@ -99,6 +99,10 @@ public struct TerminalPathResolver: Sendable {
     /// URLs are accepted; URL schemes for remote or non-file resources are
     /// left to the URL router.
     ///
+    /// A relative path that names nothing under `cwd` is tried again from
+    /// the git root above it: agents print repository paths
+    /// (`build-fleet/ORG-BACKUP.md`) while the shell sits in a subfolder.
+    ///
     /// - Parameters:
     ///   - rawText: The raw open-URL text from the runtime.
     ///   - cwd: The surface's working directory.
@@ -106,6 +110,34 @@ public struct TerminalPathResolver: Sendable {
     public func resolveOpenURLFileReference(
         _ rawText: String,
         cwd: String?
+    ) -> TerminalFileReference? {
+        if let reference = resolveOpenURLFileReference(rawText, base: cwd) {
+            return reference
+        }
+        guard let root = gitRoot(above: cwd) else { return nil }
+        return resolveOpenURLFileReference(rawText, base: root)
+    }
+
+    /// The nearest folder at or above `cwd` that holds `.git` (a folder, or
+    /// a file in a worktree), other than `cwd` itself; `nil` when there is none.
+    private func gitRoot(above cwd: String?) -> String? {
+        guard let cwd, !cwd.isEmpty else { return nil }
+        let start = ((cwd as NSString).expandingTildeInPath as NSString).standardizingPath
+        guard start.hasPrefix("/") else { return nil }
+        var folder = start
+        while true {
+            if fileExists((folder as NSString).appendingPathComponent(".git")) {
+                return folder == start ? nil : folder
+            }
+            let parent = (folder as NSString).deletingLastPathComponent
+            guard !parent.isEmpty, parent != folder else { return nil }
+            folder = parent
+        }
+    }
+
+    private func resolveOpenURLFileReference(
+        _ rawText: String,
+        base cwd: String?
     ) -> TerminalFileReference? {
         let trimmed = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
@@ -158,6 +190,32 @@ public struct TerminalPathResolver: Sendable {
     /// - Returns: The first existing standardized path, or `nil`.
     public func resolveOpenURLFilePath(_ rawText: String, cwd: String?) -> String? {
         resolveOpenURLFileReference(rawText, cwd: cwd)?.path
+    }
+
+    /// Resolves the first candidate text that names an existing local file.
+    ///
+    /// Backs the terminal context menu's "Reveal in Finder" item. Callers pass
+    /// candidates in priority order (for example the hovered link, then the
+    /// selection); `nil` and blank
+    /// entries are skipped. Each candidate goes through
+    /// ``resolveOpenURLFileReference(_:cwd:)``, so absolute, `~`, relative,
+    /// `file://`, and `path:line[:column]` spellings all resolve the same way
+    /// cmd-click does. Multi-line text is never a path and is ignored.
+    ///
+    /// - Parameters:
+    ///   - candidates: Raw texts to try, highest priority first.
+    ///   - cwd: The surface's working directory used for relative candidates.
+    /// - Returns: The first existing standardized path, or `nil`.
+    public func resolveRevealPath(candidates: [String?], cwd: String?) -> String? {
+        for candidate in candidates {
+            guard let trimmed = candidate?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !trimmed.isEmpty,
+                  !trimmed.contains(where: \.isNewline) else { continue }
+            if let path = resolveOpenURLFilePath(trimmed, cwd: cwd) {
+                return path
+            }
+        }
+        return nil
     }
 
     /// Converts a token into a local path while rejecting non-file URL schemes.

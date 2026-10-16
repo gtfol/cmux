@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { after } from "next/server";
+import { deferCoderouterTask } from "./deferredTask";
 
 import { POSTHOG_HOST, POSTHOG_PROJECT_KEY } from "../analytics/iosEventPolicy";
 import {
@@ -21,6 +21,9 @@ export type CoderouterAnalyticsEvent =
   | "coderouter_account_removed"
   | "coderouter_account_status_viewed"
   | "coderouter_auth_rejected"
+  | "coderouter_handoff_lease_issued"
+  | "coderouter_handoff_lease_exchanged"
+  | "coderouter_handoff_rejected"
   | "coderouter_route_session_issued"
   | "coderouter_route_session_revoked"
   | "coderouter_api_key_created"
@@ -78,20 +81,7 @@ const MAX_COUNT = 1_000_000_000_000;
 const ANALYTICS_SCHEMA_VERSION = 3;
 const ANALYTICS_SERVICE_VERSION = "coderouter-web-v1";
 
-/**
- * Runs a best-effort telemetry task after the response is sent. Shared by the
- * PostHog capture and the ClickHouse usage ledger so both leave the request
- * path the same way.
- */
-export function deferCoderouterTask(task: Promise<unknown>): void {
-  try {
-    after(task);
-  } catch {
-    // Unit tests and non-request scripts do not have a Next request scope.
-    // The promise is already running; always absorb rejection.
-    void task.catch(() => undefined);
-  }
-}
+export { deferCoderouterTask };
 
 /**
  * A PostHog event whose properties are built by a trusted caller
@@ -109,7 +99,7 @@ export type CoderouterRawEvent = {
 };
 
 /** Property keys a raw event may carry; anything else is dropped. */
-const RAW_EVENT_KEY = /^(\$ai_[a-z_]+|\$exception_[a-z_]+|coderouter_[a-z_]+|trace_id|vercel_request_id|team_id|upstream_kind|upstream_account_id|provider|agent|attempt|attempts|status|outcome|failure_stage|failure_code|healthy|total|sticky|cooldown_ms|forced|surface|reason|alert_key|severity|title|count|threshold|window_minutes)$/;
+const RAW_EVENT_KEY = /^(\$ai_[a-z_]+|\$exception_[a-z_]+|coderouter_[a-z_]+|operation|trace_id|vercel_request_id|team_id|upstream_kind|upstream_account_id|provider|agent|attempt|attempts|status|outcome|failure_stage|failure_code|healthy|total|sticky|cooldown_ms|forced|surface|reason|alert_key|severity|title|count|threshold|window_minutes)$/;
 
 /**
  * Sends one batch of operational exception/alert events. Same gate, config, identity and
@@ -277,6 +267,8 @@ async function deliver(
 function eventNeedsUser(event: CoderouterAnalyticsEvent): boolean {
   return event === "coderouter_account_added" ||
     event === "coderouter_account_removed" ||
+    event === "coderouter_handoff_lease_issued" ||
+    event === "coderouter_handoff_lease_exchanged" ||
     event === "coderouter_route_session_issued" ||
     event === "coderouter_route_session_revoked" ||
     event === "coderouter_api_key_created" ||
@@ -290,6 +282,7 @@ function eventProperties(
   event: CoderouterAnalyticsEvent,
   input: Readonly<Record<string, AnalyticsScalar | null | undefined>>,
 ): Record<string, AnalyticsScalar> | null {
+  if (event.startsWith("coderouter_handoff_")) return handoffEventProperties(event, input);
   switch (event) {
     case "coderouter_model_request_completed":
       // Deprecated compatibility input. Usage is recorded only by
@@ -337,6 +330,35 @@ function eventProperties(
   // Keep this closed-schema builder fail-closed if a new event is added before
   // its telemetry properties are defined.
   return null;
+}
+
+function handoffEventProperties(
+  event: CoderouterAnalyticsEvent,
+  input: Readonly<Record<string, AnalyticsScalar | null | undefined>>,
+): Record<string, AnalyticsScalar> | null {
+  switch (event) {
+    case "coderouter_handoff_lease_issued":
+      return { authorization_mode: "native_stack" };
+    case "coderouter_handoff_lease_exchanged": {
+      const mode = enumValue(input.authorization_mode, [
+        "lease",
+        "native_confirmation",
+      ]);
+      return mode ? { authorization_mode: mode } : null;
+    }
+    case "coderouter_handoff_rejected": {
+      const surface = enumValue(input.surface, ["mint", "exchange"]);
+      const reason = enumValue(input.reason, [
+        "missing_native_auth",
+        "invalid_native_auth",
+        "invalid_lease",
+        "expired_or_consumed",
+      ]);
+      return surface && reason ? { surface, reason } : null;
+    }
+    default:
+      return null;
+  }
 }
 
 function accountAddedProperties(

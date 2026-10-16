@@ -291,8 +291,14 @@ extension CMUXCLI {
         var isDirectory = ObjCBool(false)
         guard fileManager.fileExists(atPath: target.path, isDirectory: &isDirectory) else {
             let message = target.missingIsError
-                ? "file not found"
-                : "not found; cmux will use defaults until this file exists"
+                ? CmuxConfigValidationLocalization().string(
+                    "config.validation.cli.doctor.fileNotFound",
+                    defaultValue: "file not found"
+                )
+                : CmuxConfigValidationLocalization().string(
+                    "config.validation.cli.doctor.missingDefaults",
+                    defaultValue: "not found; cmux will use defaults until this file exists"
+                )
             return ConfigDoctorFinding(
                 label: target.label,
                 displayPath: target.displayPath,
@@ -309,26 +315,35 @@ extension CMUXCLI {
                 displayPath: target.displayPath,
                 path: target.path,
                 status: "error",
-                message: "path is a directory, expected a file",
+                message: CmuxConfigValidationLocalization().string(
+                    "config.validation.cli.doctor.pathIsDirectory",
+                    defaultValue: "path is a directory, expected a file"
+                ),
                 keys: [],
                 byteCount: nil
             )
         }
 
+        var loadedData: Data?
         do {
             let data = try Data(contentsOf: URL(fileURLWithPath: target.path))
+            loadedData = data
             guard !data.isEmpty else {
                 return ConfigDoctorFinding(
                     label: target.label,
                     displayPath: target.displayPath,
                     path: target.path,
                     status: "error",
-                    message: "file is empty",
+                    message: CmuxConfigValidationLocalization().string(
+                        "config.validation.cli.doctor.fileEmpty",
+                        defaultValue: "file is empty"
+                    ),
                     keys: [],
                     byteCount: 0
                 )
             }
             let sanitized = try JSONCParser.preprocess(data: data)
+            loadedData = sanitized
             let object = try JSONSerialization.jsonObject(with: sanitized)
             guard let dictionary = object as? [String: Any] else {
                 return ConfigDoctorFinding(
@@ -336,7 +351,10 @@ extension CMUXCLI {
                     displayPath: target.displayPath,
                     path: target.path,
                     status: "error",
-                    message: "top-level value must be a JSON object",
+                    message: CmuxConfigValidationLocalization().string(
+                        "config.validation.cli.doctor.topLevelObject",
+                        defaultValue: "top-level value must be a JSON object"
+                    ),
                     keys: [],
                     byteCount: data.count
                 )
@@ -376,7 +394,11 @@ extension CMUXCLI {
                 displayPath: target.displayPath,
                 path: target.path,
                 status: "error",
-                message: Self.configDoctorErrorMessage(error),
+                message: Self.configDoctorErrorMessage(
+                    error,
+                    data: loadedData,
+                    displayPath: target.displayPath
+                ),
                 keys: [],
                 byteCount: nil
             )
@@ -384,15 +406,30 @@ extension CMUXCLI {
     }
 
     private func printConfigDoctorReport(_ report: ConfigDoctorReport, commandName: String) {
+        let localization = CmuxConfigValidationLocalization()
+        let pathLabel = localization.string(
+            "config.validation.cli.doctor.report.path",
+            defaultValue: "path"
+        )
+        let bytesLabel = localization.string(
+            "config.validation.cli.doctor.report.bytes",
+            defaultValue: "bytes"
+        )
+        let keysLabel = localization.string(
+            "config.validation.cli.doctor.report.keys",
+            defaultValue: "keys"
+        )
         print("cmux config \(commandName)")
         for finding in report.findings {
-            print("\(finding.status.uppercased()) \(finding.label): \(finding.displayPath)")
-            print("  path: \(finding.path)")
+            let status = Self.localizedConfigDoctorStatus(finding.status)
+            let label = Self.localizedConfigDoctorLabel(finding.label)
+            print("\(status) \(label): \(finding.displayPath)")
+            print("  \(pathLabel): \(finding.path)")
             if let byteCount = finding.byteCount {
-                print("  bytes: \(byteCount)")
+                print("  \(bytesLabel): \(byteCount)")
             }
             if !finding.keys.isEmpty {
-                print("  keys: \(finding.keys.joined(separator: ", "))")
+                print("  \(keysLabel): \(finding.keys.joined(separator: ", "))")
             }
             if let message = finding.message {
                 print("  \(message)")
@@ -402,9 +439,78 @@ extension CMUXCLI {
             }
         }
         print()
-        print("Docs: \(Self.settingsDocsURL)")
-        print("Schema: \(Self.settingsSchemaURL)")
-        print("Reload: cmux reload-config")
+        let docsLabel = localization.string(
+            "config.validation.cli.doctor.report.docs",
+            defaultValue: "Docs"
+        )
+        let schemaLabel = localization.string(
+            "config.validation.cli.doctor.report.schema",
+            defaultValue: "Schema"
+        )
+        let reloadLabel = localization.string(
+            "config.validation.cli.doctor.report.reload",
+            defaultValue: "Reload"
+        )
+        print("\(docsLabel): \(Self.settingsDocsURL)")
+        print("\(schemaLabel): \(Self.settingsSchemaURL)")
+        print("\(reloadLabel): cmux reload-config")
+    }
+
+    private static func localizedConfigDoctorStatus(_ status: String) -> String {
+        let localization = CmuxConfigValidationLocalization()
+        switch status {
+        case "ok":
+            return localization.string(
+                "config.validation.cli.doctor.status.ok",
+                defaultValue: "OK"
+            )
+        case "error":
+            return localization.string(
+                "config.validation.cli.doctor.status.error",
+                defaultValue: "ERROR"
+            )
+        case "missing":
+            return localization.string(
+                "config.validation.cli.doctor.status.missing",
+                defaultValue: "MISSING"
+            )
+        default:
+            return status.uppercased()
+        }
+    }
+
+    private static func localizedConfigDoctorLabel(_ label: String) -> String {
+        let localization = CmuxConfigValidationLocalization()
+        switch label {
+        case "primary":
+            return localization.string(
+                "config.validation.cli.doctor.label.primary",
+                defaultValue: "primary"
+            )
+        case "project":
+            return localization.string(
+                "config.validation.cli.doctor.label.project",
+                defaultValue: "project"
+            )
+        case "legacy config":
+            return localization.string(
+                "config.validation.cli.doctor.label.legacyConfig",
+                defaultValue: "legacy config"
+            )
+        case "legacy app support":
+            return localization.string(
+                "config.validation.cli.doctor.label.legacyAppSupport",
+                defaultValue: "legacy app support"
+            )
+        default:
+            guard label.hasPrefix("custom ") else { return label }
+            let suffix = String(label.dropFirst("custom ".count))
+            return localization.format(
+                "config.validation.cli.doctor.label.custom",
+                defaultValue: "custom %@",
+                suffix
+            )
+        }
     }
 
     private func configSemanticScope(for path: String) -> CmuxConfigSemanticScope {
@@ -460,23 +566,53 @@ extension CMUXCLI {
         return normalized
     }
 
-    static func configDoctorErrorMessage(_ error: Error) -> String {
+    static func configDoctorErrorMessage(
+        _ error: Error,
+        data: Data? = nil,
+        displayPath: String? = nil
+    ) -> String {
         let nsError = error as NSError
         if let debug = nsError.userInfo[NSDebugDescriptionErrorKey] as? String {
             let trimmed = debug.trimmingCharacters(in: .whitespacesAndNewlines)
             if !trimmed.isEmpty {
-                return trimmed
+                return Self.configDoctorLocationPrefix(error: error, data: data, displayPath: displayPath)
+                    + trimmed
             }
         }
         let described = String(describing: error).trimmingCharacters(in: .whitespacesAndNewlines)
         if !described.isEmpty {
-            return described
+            return Self.configDoctorLocationPrefix(error: error, data: data, displayPath: displayPath)
+                + described
         }
         let localized = nsError.localizedDescription.trimmingCharacters(in: .whitespacesAndNewlines)
         if !localized.isEmpty {
-            return localized
+            return Self.configDoctorLocationPrefix(error: error, data: data, displayPath: displayPath)
+                + localized
         }
-        return "unknown config parse error"
+        return Self.configDoctorLocationPrefix(error: error, data: data, displayPath: displayPath)
+            + CmuxConfigValidationLocalization().string(
+            "config.validation.cli.doctor.unknownParseError",
+            defaultValue: "unknown config parse error"
+        )
+    }
+
+    private static func configDoctorLocationPrefix(
+        error: Error,
+        data: Data?,
+        displayPath: String?
+    ) -> String {
+        guard let displayPath else { return "" }
+        let line: Int
+        if let data {
+            let errorIndex = (error as NSError).userInfo["NSJSONSerializationErrorIndex"] as? Int ?? 0
+            let bounded = min(max(errorIndex, 0), data.count)
+            line = data.prefix(bounded).reduce(into: 1) { count, byte in
+                if byte == 0x0A { count += 1 }
+            }
+        } else {
+            line = 1
+        }
+        return "\(displayPath):\(line): "
     }
 
 }

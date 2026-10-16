@@ -1,5 +1,6 @@
 import AppKit
 import CmuxCommandPalette
+import CmuxWorkspaces
 import CmuxSidebar
 import CmuxSwiftRender
 
@@ -11,14 +12,21 @@ extension ContentView {
         if let rightSidebarModeAction = commandPaletteRightSidebarModeShortcutAction(forCommandID: commandId) {
             return rightSidebarModeAction
         }
+        if let parityCommand = ShortcutParityPaletteCommand(rawValue: commandId) {
+            return parityCommand.shortcutAction
+        }
 
         switch commandId {
+        case Self.commandPaletteAuthTeamPickerCommandId:
+            return .openTeamPicker
         case "palette.newWorkspace":
             return .newTab
         case "palette.newBrowserWorkspace":
             return .newBrowserWorkspace
         case ContentView.commandPaletteCloudNewMachineCommandId:
             return .newCloudMachine
+        case ContentView.commandPaletteCloudNewWorkspaceCommandId:
+            return .newCloudWorkspace
         case "palette.newWindow":
             return .newWindow
         case "palette.openFolder":
@@ -53,6 +61,8 @@ extension ContentView {
             return .editWorkspaceDescription
         case "palette.markWorkspaceDone":
             return .markWorkspaceDone
+        case WorkspaceTodoPaletteCommands.cycleWorkspaceStatusCommandId:
+            return .cycleWorkspaceStatus
         case "palette.nextWorkspace":
             return .nextSidebarTab
         case "palette.previousWorkspace":
@@ -97,12 +107,18 @@ extension ContentView {
             return .attachTextBoxFile
         case "palette.terminalSendCtrlF":
             return .sendCtrlFToTerminal
+        case "palette.terminalPasteLastScreenshot":
+            return .pasteLastScreenshot
+        case "palette.terminalSizeToMyWindow":
+            return .sizeTerminalToMyWindow
         case "palette.terminalClearScreenKeepScrollback":
             return .clearScreenKeepScrollback
         case "palette.toggleSplitZoom":
             return .toggleSplitZoom
         case "palette.equalizeSplits":
             return .equalizeSplits
+        case "palette.newPaneAutoLayout":
+            return .newPaneAutoLayout
         case "palette.resizePaneLeft":
             return .resizePaneLeft
         case "palette.resizePaneRight":
@@ -274,11 +290,41 @@ extension ContentView {
             )
         }
         let selectedWorkspace = tabManager.tabs.first { $0.id == selectedId }
-        let snapshot = CustomSidebarContextSnapshot(
+        return Self.customSidebarDataContext(
             workspaces: workspaces,
+            workspaceGroups: tabManager.workspaceGroups,
             selectedWorkspaceId: selectedId,
             selectedWorkspaceTitle: selectedWorkspace?.customTitle ?? selectedWorkspace?.title ?? "",
             totalUnreadCount: sidebarUnread.totalUnreadCount,
+            now: now
+        )
+    }
+
+    static func customSidebarDataContext(
+        workspaces: [CustomSidebarWorkspaceSnapshot],
+        workspaceGroups: [WorkspaceGroup],
+        selectedWorkspaceId: UUID?,
+        selectedWorkspaceTitle: String,
+        totalUnreadCount: Int,
+        now: Date
+    ) -> [String: SwiftValue] {
+        let groups = workspaceGroups.map { group in
+            CustomSidebarGroupSnapshot(
+                id: group.id,
+                name: group.name,
+                isCollapsed: group.isCollapsed,
+                isPinned: group.isPinned,
+                anchorWorkspaceId: group.anchorWorkspaceId,
+                customColor: group.customColor,
+                iconSymbol: group.iconSymbol
+            )
+        }
+        let snapshot = CustomSidebarContextSnapshot(
+            workspaces: workspaces,
+            groups: groups,
+            selectedWorkspaceId: selectedWorkspaceId,
+            selectedWorkspaceTitle: selectedWorkspaceTitle,
+            totalUnreadCount: totalUnreadCount,
             now: now
         )
         return CustomSidebarDataContextBuilder().dataContext(for: snapshot)

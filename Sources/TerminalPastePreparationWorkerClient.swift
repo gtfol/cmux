@@ -14,6 +14,7 @@ struct TerminalPastePreparationWorkerClient: Sendable {
     private let executableURL: URL
     private let pasteboardService: TerminalPasteboardService?
     private let plainTextExecutableURL: URL?
+    private let plainTextWorkerPool: TerminalPlainTextPasteWorkerPool?
 
     init(
         executableURL: URL,
@@ -22,17 +23,22 @@ struct TerminalPastePreparationWorkerClient: Sendable {
             forResource: "cmux-paste-text-worker",
             withExtension: nil,
             subdirectory: "bin"
-        )
+        ),
+        prewarmPlainTextWorker: Bool = false
     ) {
         self.executableURL = executableURL
         self.pasteboardService = pasteboardService
         self.plainTextExecutableURL = plainTextExecutableURL
+        plainTextWorkerPool = prewarmPlainTextWorker
+            ? plainTextExecutableURL.map(TerminalPlainTextPasteWorkerPool.init)
+            : nil
     }
 
     private init(executableURL: URL) {
         self.executableURL = executableURL
         pasteboardService = nil
         plainTextExecutableURL = nil
+        plainTextWorkerPool = nil
     }
 
     static func reexecingCurrentBinary(
@@ -47,7 +53,8 @@ struct TerminalPastePreparationWorkerClient: Sendable {
                 forResource: "cmux-paste-text-worker",
                 withExtension: nil,
                 subdirectory: "bin"
-            )
+            ),
+            prewarmPlainTextWorker: true
         )
     }
 
@@ -81,10 +88,68 @@ struct TerminalPastePreparationWorkerClient: Sendable {
 #else
     @Sendable
 #endif
+    func prepareFastPath(
+        _ request: TerminalPastePreparationRequest
+    ) async throws -> TerminalPastePreparationResult? {
+        guard let plainTextWorkerPool,
+              case .terminal? = request.destination else {
+            return nil
+        }
+        switch request.mode {
+        case .paste?, .plainText?:
+            break
+        default:
+            return nil
+        }
+
+        let response = try await plainTextWorkerPool.request(
+            JSONEncoder().encode(request)
+        )
+        try Task.checkCancellation()
+        guard response.status == 0 else {
+            // Status 73 means the resident helper cannot safely answer this
+            // request (for example an image or faithful rich-text fallback).
+            // The caller must send it through the isolated full worker lane.
+            return nil
+        }
+        guard let text = String(data: response.payload, encoding: .utf8) else {
+            throw TerminalPastePreparationWorkerError.invalidWorkerResponse
+        }
+        return .terminal(text.isEmpty ? .reject : .insertText(text))
+    }
+
+#if compiler(>=6.2)
+    @concurrent
+#else
+    @Sendable
+#endif
     func prepare(
         _ request: TerminalPastePreparationRequest
     ) async throws -> TerminalPastePreparationResult {
         try Task.checkCancellation()
+        var didProbePlainText = false
+        // Native pastes and terminal-initiated reads both use the resident
+        // helper first. The helper applies the request mode's flavor policy;
+        // only native pastes may fall back to image/file preparation.
+        let canUsePlainTextWorker: Bool
+        switch (request.mode, request.destination) {
+        case (.paste?, .terminal?), (.plainText?, .terminal?):
+            canUsePlainTextWorker = true
+        default:
+            canUsePlainTextWorker = false
+        }
+        if canUsePlainTextWorker,
+           let plainTextWorkerPool {
+            let response = try await plainTextWorkerPool.request(JSONEncoder().encode(request))
+            try Task.checkCancellation()
+            if response.status == 0 {
+                guard let text = String(data: response.payload, encoding: .utf8) else {
+                    throw TerminalPastePreparationWorkerError.invalidWorkerResponse
+                }
+                return .terminal(text.isEmpty ? .reject : .insertText(text))
+            }
+            didProbePlainText = true
+        }
         let workingDirectory = try makeWorkingDirectory()
         defer {
             try? FileManager.default.removeItem(at: workingDirectory)
@@ -103,8 +168,8 @@ struct TerminalPastePreparationWorkerClient: Sendable {
         // An explicit ineligible result is the only reason to retry in the full
         // worker. A stalled/crashed provider must fail locally, not run twice.
         var status: Int32 = 73
-        if case .paste? = request.mode,
-           case .terminal? = request.destination,
+        if !didProbePlainText,
+           canUsePlainTextWorker,
            let plainTextExecutableURL {
             status = try await runWorker(
                 executable: plainTextExecutableURL,
@@ -178,10 +243,18 @@ struct TerminalPastePreparationWorkerClient: Sendable {
         workingDirectory: URL
     ) async throws -> Int32 {
         try Task.checkCancellation()
+        // Only the full worker re-executes the app binary, whose startup alone
+        // can outlast the paste deadline. The small text helper stays fully
+        // inside the deadline.
+        let startup = modeArgument == Self.workerModeArgument
+            ? TerminalImageTransferPreparationService.WorkerStartup.current
+            : nil
+        await startup?.launching()
         let process = TerminalPastePreparationProcess(
             executableURL: executable,
             arguments: [modeArgument, Self.workingDirectoryArgument, workingDirectory.path],
-            environment: ProcessInfo.processInfo.environment
+            environment: ProcessInfo.processInfo.environment,
+            readinessSignal: startup?.ready
         )
         let status = try await process.run()
         try Task.checkCancellation()

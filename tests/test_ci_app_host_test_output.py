@@ -14,10 +14,10 @@ import yaml
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts/ci/classify-app-host-test-output.py"
-TEST_DEPOT_WORKFLOW = ROOT / ".github/workflows/test-depot.yml"
-TEST_DEPOT_RUN_UNIT_TESTS = next(
+SUITE_WORKFLOW = ROOT / ".github/workflows/test-macos-suite.yml"
+SUITE_RUN_UNIT_TESTS = next(
     step["run"]
-    for step in yaml.safe_load(TEST_DEPOT_WORKFLOW.read_text(encoding="utf-8"))["jobs"]["tests"]["steps"]
+    for step in yaml.safe_load(SUITE_WORKFLOW.read_text(encoding="utf-8"))["jobs"]["tests"]["steps"]
     if step.get("name") == "Run unit tests"
 )
 SPEC = importlib.util.spec_from_file_location("classify_app_host_test_output", SCRIPT)
@@ -76,6 +76,35 @@ class AppHostTestOutputTests(unittest.TestCase):
         passed, _ = MODULE.classify("Executed 0 tests, with 0 failures (0 unexpected)\n")
 
         self.assertFalse(passed)
+
+    def test_swift_testing_failure_is_not_masked_by_expected_xctest_failures(self) -> None:
+        passed, message = MODULE.classify(
+            "Executed 4 tests, with 1 failure (0 unexpected)\n"
+            "Test run with 3 tests in 1 suite failed after 0.1 seconds.\n"
+        )
+
+        self.assertFalse(passed)
+        self.assertIn("Swift Testing reported a failed test run", message)
+
+    def test_swift_testing_assertion_is_not_masked_by_expected_xctest_failures(self) -> None:
+        passed, message = MODULE.classify(
+            "Executed 4 tests, with 1 failure (0 unexpected)\n"
+            "✘ Test accountPersists() recorded an issue at AccountTests.swift:42:7: "
+            "Expectation failed: expected true\n"
+            "Test run with 3 tests in 1 suite passed after 0.1 seconds.\n"
+        )
+
+        self.assertFalse(passed)
+        self.assertIn("test assertion failure", message)
+
+    def test_expected_xctest_failure_diagnostic_does_not_spoof_swift_testing(self) -> None:
+        passed, message = MODULE.classify(
+            "XCTExpectFailure: matcher accepted Assertion Failure: XCTAssertTrue failed\n"
+            "Expectation failed: this application diagnostic is expected in the fixture\n"
+            "Executed 1 test, with 0 failures (0 unexpected)\n"
+        )
+
+        self.assertTrue(passed, message)
 
     def test_unexpected_failure_in_earlier_summary_is_not_masked(self) -> None:
         passed, message = MODULE.classify(
@@ -339,7 +368,7 @@ class AppHostTestOutputTests(unittest.TestCase):
                 "TEST_RESULTS_ROOT": str(root / "results"),
             }
             completed = subprocess.run(
-                ["bash", "-c", TEST_DEPOT_RUN_UNIT_TESTS],
+                ["bash", "-c", SUITE_RUN_UNIT_TESTS],
                 cwd=root,
                 env=environment,
                 capture_output=True,
@@ -376,7 +405,7 @@ class AppHostTestOutputTests(unittest.TestCase):
                     "FAKE_TEST_MODE": mode,
                 }
                 completed = subprocess.run(
-                    ["bash", "-c", TEST_DEPOT_RUN_UNIT_TESTS],
+                    ["bash", "-c", SUITE_RUN_UNIT_TESTS],
                     cwd=root,
                     env=environment,
                     capture_output=True,
@@ -410,7 +439,7 @@ class AppHostTestOutputTests(unittest.TestCase):
             fake_runner.chmod(0o755)
             results = root / "results"
             completed = subprocess.run(
-                ["bash", "-c", TEST_DEPOT_RUN_UNIT_TESTS],
+                ["bash", "-c", SUITE_RUN_UNIT_TESTS],
                 cwd=root,
                 env={
                     **os.environ,
@@ -453,7 +482,7 @@ class AppHostTestOutputTests(unittest.TestCase):
                 )
                 fake_runner.chmod(0o755)
                 completed = subprocess.run(
-                    ["bash", "-c", TEST_DEPOT_RUN_UNIT_TESTS],
+                    ["bash", "-c", SUITE_RUN_UNIT_TESTS],
                     cwd=root,
                     env={
                         **os.environ,

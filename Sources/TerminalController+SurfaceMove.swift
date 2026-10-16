@@ -1,3 +1,4 @@
+import CmuxCloud
 import AppKit
 import Bonsplit
 import Foundation
@@ -33,6 +34,10 @@ extension TerminalController {
             guard let source = app.locateSurface(surfaceId: surfaceId),
                   let sourceWorkspace = source.tabManager.tabs.first(where: { $0.id == source.workspaceId }) else {
                 result = .err(code: "not_found", message: "Surface not found", data: ["surface_id": surfaceId.uuidString])
+                return
+            }
+            if let refusal = v2BrowserReplTabRefusal(surfaceId) {
+                result = refusal
                 return
             }
 

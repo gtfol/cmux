@@ -10,6 +10,10 @@ final class FakeSurfaceControlCommandContext: ControlCommandContext {
     var createResolution: ControlSurfaceCreateResolution = .tabManagerUnavailable
     var createInputs: ControlSurfaceCreateInputs?
     var surfaceListSnapshot: ControlSurfaceListSnapshot?
+    var focusResolution: ControlSurfaceFocusResolution = .tabManagerUnavailable
+    var jumpToLastPromptResolution: ControlSurfaceFocusResolution?
+    var closeResolution: ControlSurfaceCloseResolution = .tabManagerUnavailable
+    var onSurfaceClose: (() -> Void)?
     var resumeResolution: ControlSurfaceResumeResolution = .surfaceNotFound
     var resumeSetInputs: ControlSurfaceResumeSetInputs?
     var resumeGetClaim: (
@@ -42,7 +46,7 @@ final class FakeSurfaceControlCommandContext: ControlCommandContext {
         .tabManagerUnavailable
     }
     func controlFocusWindow(id: UUID) -> Bool { false }
-    func controlCreateWindowAndActivate() -> UUID? { nil }
+    func controlCreateWindowAndActivate(title: String?) -> UUID? { nil }
     func controlCloseWindow(id: UUID) -> Bool { false }
     func controlAvailableDisplays() -> [ControlDisplayInfo] { [] }
     func controlWindowExists(id: UUID) -> Bool { false }
@@ -51,6 +55,15 @@ final class FakeSurfaceControlCommandContext: ControlCommandContext {
     func controlSurfaceRoutingResolvesTabManager(routing: ControlRoutingSelectors) -> Bool { true }
     func controlSurfaceList(routing: ControlRoutingSelectors) -> ControlSurfaceListSnapshot? {
         surfaceListSnapshot
+    }
+    func controlSurfaceClose(
+        routing: ControlRoutingSelectors,
+        surfaceID: UUID?,
+        hasSurfaceIDParam: Bool,
+        force: Bool
+    ) -> ControlSurfaceCloseResolution {
+        onSurfaceClose?()
+        return closeResolution
     }
     func controlPaneRoutingResolvesTabManager(routing: ControlRoutingSelectors) -> Bool { true }
 
@@ -180,5 +193,16 @@ final class FakeSurfaceControlCommandContext: ControlCommandContext {
             stateRawValue
         )
         return reportShellStateResolution
+    }
+
+    func controlSurfaceFocus(
+        routing: ControlRoutingSelectors,
+        surfaceID: UUID
+    ) -> ControlSurfaceFocusResolution {
+        focusResolution
+    }
+
+    func controlSurfaceJumpToLastPrompt() -> ControlSurfaceFocusResolution? {
+        jumpToLastPromptResolution
     }
 }

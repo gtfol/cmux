@@ -134,6 +134,119 @@ private struct NetworkOutcomeTestConsent: AnalyticsConsentProviding {
         #expect(event?.properties["event_c"] == .int(7))
     }
 
+    @Test func irohPathEventsEmitEachRouteTransitionForAxiom() async {
+        let uploader = RecordingAnalyticsUploader()
+        let emitter = AnalyticsEmitter(
+            uploader: uploader,
+            consent: NetworkOutcomeTestConsent(isTelemetryEnabled: true),
+            anonymousID: "local-install"
+        )
+        let reporter = MobileNetworkOutcomeReporter(emitter: emitter)
+
+        reporter.ingest(DiagnosticEvent(
+            code: .transportPathEvent,
+            tNanos: 1,
+            surface: 8,
+            a: 1,
+            b: DiagnosticPathKind.relay.rawValue,
+            c: 23
+        ))
+        reporter.ingest(DiagnosticEvent(
+            code: .transportPathEvent,
+            tNanos: 2,
+            surface: 8,
+            a: 3,
+            b: DiagnosticPathKind.relay.rawValue,
+            c: 23
+        ))
+        reporter.ingest(DiagnosticEvent(
+            code: .transportPathEvent,
+            tNanos: 3,
+            surface: 8,
+            a: 1,
+            b: DiagnosticPathKind.privateNetwork.rawValue,
+            c: 23
+        ))
+        reporter.ingest(DiagnosticEvent(
+            code: .selectedPathChanged,
+            tNanos: 4,
+            surface: 8,
+            a: DiagnosticPathKind.direct.rawValue,
+            c: 23
+        ))
+        await reporter.flush()
+
+        let events = await uploader.uploadedEvents
+        #expect(events.map(\.name) == Array(repeating: MobileNetworkOutcomeReporter.pathEventName, count: 4))
+        #expect(events.map { $0.properties["operation"] } == [
+            .string("opened"),
+            .string("selected"),
+            .string("opened"),
+            .string("snapshot"),
+        ])
+        #expect(events.map { $0.properties["path"] } == [
+            .string("relay"),
+            .string("relay"),
+            .string("private_network"),
+            .string("direct"),
+        ])
+        #expect(events.allSatisfy { $0.properties["transport"] == .string("iroh") })
+        #expect(events.allSatisfy { $0.properties["event_surface"] == .int(8) })
+        #expect(events.allSatisfy { $0.properties["event_c"] == .int(23) })
+    }
+
+    @Test func irohPathInventoryEmitsRelayAndNonRelayCountsForAxiom() async {
+        let uploader = RecordingAnalyticsUploader()
+        let emitter = AnalyticsEmitter(
+            uploader: uploader,
+            consent: NetworkOutcomeTestConsent(isTelemetryEnabled: true),
+            anonymousID: "local-install"
+        )
+        let reporter = MobileNetworkOutcomeReporter(emitter: emitter)
+
+        reporter.ingest(DiagnosticEvent(
+            code: .transportPathInventory,
+            tNanos: 1,
+            surface: 8,
+            a: 1,
+            b: 2,
+            c: 23
+        ))
+        await reporter.flush()
+
+        let event = await uploader.uploadedEvents.first
+        #expect(event?.name == MobileNetworkOutcomeReporter.pathInventoryEventName)
+        #expect(event?.properties["operation"] == .string("inventory"))
+        #expect(event?.properties["transport"] == .string("iroh"))
+        #expect(event?.properties["relay_path_count"] == .int(1))
+        #expect(event?.properties["non_relay_path_count"] == .int(2))
+        #expect(event?.properties["path_count"] == .int(3))
+        #expect(event?.properties["event_code"] == .string("transportPathInventory"))
+        #expect(event?.properties["event_code_raw"] == .int(83))
+        #expect(event?.properties["event_c"] == .int(23))
+    }
+
+    @Test func irohPathInventoryRejectsCountsAboveAggregateBound() async {
+        let uploader = RecordingAnalyticsUploader()
+        let emitter = AnalyticsEmitter(
+            uploader: uploader,
+            consent: NetworkOutcomeTestConsent(isTelemetryEnabled: true),
+            anonymousID: "local-install"
+        )
+        let reporter = MobileNetworkOutcomeReporter(emitter: emitter)
+
+        reporter.ingest(DiagnosticEvent(
+            code: .transportPathInventory,
+            tNanos: 1,
+            a: 64,
+            b: 1,
+            c: 23
+        ))
+        await reporter.flush()
+
+        #expect(await uploader.uploadedEvents.isEmpty)
+    }
+
     @Test func cancelledDialEmitsLifecycleReasonAndAttemptContext() {
         let properties = MobileNetworkOutcomeReporter.properties(for: DiagnosticEvent(
             code: .transportDialCancelled,

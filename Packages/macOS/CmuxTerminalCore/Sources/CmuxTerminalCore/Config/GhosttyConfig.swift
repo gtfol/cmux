@@ -55,6 +55,8 @@ public struct GhosttyConfig {
     public var theme: String?
     /// The configured `working-directory`, or `nil` when unset.
     public var workingDirectory: String?
+    /// The `*-inherit-working-directory` keys.
+    public var workingDirectoryInheritance = GhosttyWorkingDirectoryInheritance()
     /// The explicit `command` directive, or `nil` when Ghostty should resolve the login shell.
     public var command: String?
     /// The scrollback limit. Ghostty measures this in bytes, not lines.
@@ -324,17 +326,9 @@ public struct GhosttyConfig {
         }
     }
 
-    // Internal + @usableFromInline so it can back the public `load` default
-    // argument value (default args of public APIs are emitted into callers and
-    // cannot reference a `private` symbol). The body is not inlinable; this only
-    // widens the symbol's reference visibility, not its definition.
-    @usableFromInline
-    static func loadFromDisk(
-        preferredColorScheme: ColorSchemePreference,
-        adaptiveDefaultThemeEnabled: Bool
-    ) -> GhosttyConfig {
-        var config = GhosttyConfig()
-
+    /// The top-level config files Ghostty loads on macOS, in load order: the
+    /// user's Ghostty config, then cmux's own config files.
+    public static func resolvedConfigPaths() -> [String] {
         // Match Ghostty's default load order on macOS.
         let appSupportGhosttyDirectory = NSString(
             string: "~/Library/Application Support/com.mitchellh.ghostty"
@@ -355,6 +349,20 @@ public struct GhosttyConfig {
             configPaths.append(appSupportLegacyConfig)
         }
         configPaths.append(contentsOf: cmuxConfigPaths())
+        return configPaths
+    }
+
+    // Internal + @usableFromInline so it can back the public `load` default
+    // argument value (default args of public APIs are emitted into callers and
+    // cannot reference a `private` symbol). The body is not inlinable; this only
+    // widens the symbol's reference visibility, not its definition.
+    @usableFromInline
+    static func loadFromDisk(
+        preferredColorScheme: ColorSchemePreference,
+        adaptiveDefaultThemeEnabled: Bool
+    ) -> GhosttyConfig {
+        var config = GhosttyConfig()
+        let configPaths = resolvedConfigPaths()
 
         #if DEBUG
         let startupPreviewOverride = TerminalStartupAppearancePreviewOverride.installed
@@ -579,11 +587,11 @@ public struct GhosttyConfig {
                     if let size = Double(value) {
                         fontSize = CGFloat(size)
                     }
-                case "surface-tab-bar-font-size":
+                case Self.surfaceTabBarFontSizeKey:
                     if let size = Double(value), size.isFinite {
                         surfaceTabBarFontSize = Self.clampedSurfaceTabBarFontSize(CGFloat(size))
                     }
-                case "sidebar-font-size":
+                case Self.sidebarFontSizeKey:
                     if let size = Double(value), size.isFinite {
                         sidebarFontSize = Self.clampedSidebarFontSize(CGFloat(size))
                     }
@@ -599,6 +607,18 @@ public struct GhosttyConfig {
                     }
                 case "working-directory":
                     workingDirectory = value
+                case "window-inherit-working-directory":
+                    if let inherits = Self.parseBool(value) {
+                        workingDirectoryInheritance.window = inherits
+                    }
+                case "tab-inherit-working-directory":
+                    if let inherits = Self.parseBool(value) {
+                        workingDirectoryInheritance.tab = inherits
+                    }
+                case "split-inherit-working-directory":
+                    if let inherits = Self.parseBool(value) {
+                        workingDirectoryInheritance.split = inherits
+                    }
                 case "command":
                     if !value.isEmpty {
                         command = value
@@ -722,12 +742,12 @@ public struct GhosttyConfig {
                         unfocusedSplitFill = color
                     }
                 case "split-divider-color":
-                    if let color = NSColor(hex: value) {
+                    if let color = parseGhosttyColor(value) {
                         splitDividerColor = color
                     }
-                case "sidebar-background":
+                case Self.sidebarBackgroundKey:
                     rawSidebarBackground = value
-                case "sidebar-tint-opacity":
+                case Self.sidebarTintOpacityKey:
                     if let opacity = Double(value) {
                         sidebarTintOpacity = min(max(opacity, 0), 1)
                     }
@@ -935,12 +955,46 @@ public struct GhosttyConfig {
         configPaths: [String]
     ) -> UserAppearanceConfigSummary {
         var summary = UserAppearanceConfigSummary()
+        visitResolvedConfigDirectives(configPaths: configPaths) { key, value, _ in
+            summary.recordDirective(key: key, value: value)
+        }
+        return summary
+    }
+
+    /// Every value assigned to each of `keys` across the resolved config files,
+    /// unquoted, in Ghostty's load order (see
+    /// ``visitResolvedConfigDirectives(configPaths:_:)``), with the path of the
+    /// file that made the last assignment. A key with no assignment is absent
+    /// from both.
+    ///
+    /// Only config files are read. Values a `theme` file supplies (a theme can
+    /// set `background-opacity`, for example) are not included.
+    public static func resolvedDirectiveValues(
+        forKeys keys: Set<String>,
+        configPaths: [String] = resolvedConfigPaths()
+    ) -> (values: [String: [String]], lastSourcePaths: [String: String]) {
+        var values: [String: [String]] = [:]
+        var lastSourcePaths: [String: String] = [:]
+        visitResolvedConfigDirectives(configPaths: configPaths) { key, value, path in
+            guard keys.contains(key) else { return }
+            values[key, default: []].append(value ?? "")
+            lastSourcePaths[key] = path
+        }
+        return (values, lastSourcePaths)
+    }
+
+    /// Visits every directive in Ghostty's load order: each top-level file in
+    /// turn, then the `config-file` includes they collected, breadth first.
+    private static func visitResolvedConfigDirectives(
+        configPaths: [String],
+        _ visit: (_ key: String, _ value: String?, _ path: String) -> Void
+    ) {
         var recursiveConfigPaths: [String] = []
 
         for path in configPaths.map({ NSString(string: $0).expandingTildeInPath }) {
-            scanAppearanceConfigFile(
+            scanConfigFile(
                 atPath: path,
-                summary: &summary,
+                visit: visit,
                 recursiveConfigPaths: &recursiveConfigPaths
             )
         }
@@ -952,19 +1006,17 @@ public struct GhosttyConfig {
             guard !loadedRecursivePaths.contains(resolved) else { continue }
             loadedRecursivePaths.insert(resolved)
 
-            scanAppearanceConfigFile(
+            scanConfigFile(
                 atPath: path,
-                summary: &summary,
+                visit: visit,
                 recursiveConfigPaths: &recursiveConfigPaths
             )
         }
-
-        return summary
     }
 
-    private static func scanAppearanceConfigFile(
+    private static func scanConfigFile(
         atPath path: String,
-        summary: inout UserAppearanceConfigSummary,
+        visit: (_ key: String, _ value: String?, _ path: String) -> Void,
         recursiveConfigPaths: inout [String]
     ) {
         let resolved = (path as NSString).standardizingPath
@@ -976,7 +1028,7 @@ public struct GhosttyConfig {
         for line in contents.components(separatedBy: .newlines) {
             guard let entry = parsedConfigEntry(from: line) else { continue }
 
-            summary.recordDirective(key: entry.key, value: entry.value)
+            visit(entry.key, entry.value, resolved)
             guard entry.key == "config-file", let value = entry.value else { continue }
             applyConfigFileDirective(
                 value,
@@ -1005,6 +1057,15 @@ public struct GhosttyConfig {
     /// Clamps a surface tab-bar font size into the supported range.
     public static func clampedSurfaceTabBarFontSize(_ value: CGFloat) -> CGFloat {
         CGFloat(CmuxGhosttyConfigSettingEditor().clampedSurfaceTabBarFontSize(Double(value)))
+    }
+
+    /// Ghostty's boolean spellings; an empty value resets to the default.
+    private static func parseBool(_ value: String) -> Bool? {
+        switch value {
+        case "", "true", "t", "1": true
+        case "false", "f", "0": false
+        default: nil
+        }
     }
 
     private static func parseBackgroundBlur(_ value: String) -> GhosttyBackgroundBlur? {

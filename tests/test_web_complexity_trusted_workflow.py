@@ -20,6 +20,7 @@ import sys
 from pathlib import Path
 
 import yaml
+import git_fixture_env  # noqa: F401  (disables git auto maintenance)
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = ROOT / ".github" / "workflows" / "web-complexity-trusted.yml"
@@ -169,7 +170,9 @@ def validate_scope_python(scope_run: str) -> None:
 
 
 EXPECTED_CHECKS = [{'env': {'SCOPE_MODE': "${{ steps.selected_scope.outputs.mode || 'full' }}",
-          'SELECTED_COUNT': '${{ steps.selected_scope.outputs.selected_count }}'},
+          'SELECTED_COUNT': '${{ steps.selected_scope.outputs.selected_count }}',
+          'MERGE_REPO': '${{ steps.merge.outputs.repo }}',
+          'MERGE_TREE': '${{ steps.merge.outputs.tree }}'},
   'if': "github.event_name != 'push' && steps.scope.outputs.run == 'true'",
   'name': 'Check pull-request or merge-group source with trusted policy',
   'run': 'set -euo pipefail\n'
@@ -181,6 +184,9 @@ EXPECTED_CHECKS = [{'env': {'SCOPE_MODE': "${{ steps.selected_scope.outputs.mode
          '  --base-baseline "$GITHUB_WORKSPACE/trusted/web/oxlint-complexity-baseline.txt"\n'
          '  --head "$CANDIDATE_SHA"\n'
          ')\n'
+         'if [[ -n "$MERGE_REPO" && -n "$MERGE_TREE" ]]; then\n'
+         '  checker+=(--merge-repo "$MERGE_REPO" --merge-tree "$MERGE_TREE")\n'
+         'fi\n'
          'case "$SCOPE_MODE" in\n'
          '  full|skip)\n'
          '    echo "Web complexity: selected $SELECTED_COUNT production file(s) for conservative '
@@ -233,8 +239,9 @@ def run(
     *,
     cwd: Path | None = None,
     check: bool = True,
+    env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[bytes]:
-    result = subprocess.run(args, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    result = subprocess.run(args, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if check and result.returncode != 0:
         raise AssertionError(
             f"{args!r} failed with {result.returncode}:\n"
@@ -594,6 +601,204 @@ def test_checker_protects_trusted_scoper() -> None:
         temp.cleanup()
 
 
+def test_checker_judges_trusted_files_in_the_merge() -> None:
+    if shutil.which("node") is None:
+        raise AssertionError("node is required for the checker merge regression")
+
+    temp = tempfile.TemporaryDirectory()
+    try:
+        root = Path(temp.name)
+        repo = root / "repo"
+        repo.mkdir()
+        git(repo, "init", "-q", "-b", "main")
+        git(repo, "config", "user.email", "ci@example.com")
+        git(repo, "config", "user.name", "CI")
+        (repo / "web/scripts").mkdir(parents=True)
+        shutil.copy2(CHECKER, repo / "web/scripts/check-complexity.mjs")
+        write(repo, ".github/workflows/web-complexity-trusted.yml", "old\n")
+        write(repo, "scripts/ci/scope-web-complexity.py", "old\n")
+        branch_point = commit(repo, "branch point")
+
+        # Main updates a trusted file after the branch point.
+        write(repo, "scripts/ci/scope-web-complexity.py", "main\n")
+        main = commit(repo, "main updates the scoper")
+
+        # The trusted checkout is main, with the checker's module dependency.
+        trusted = root / "trusted"
+        git(repo, "worktree", "add", "-q", "--detach", str(trusted), main)
+        (trusted / "web/node_modules/typescript").mkdir(parents=True)
+        write(
+            trusted,
+            "web/node_modules/typescript/package.json",
+            '{"type":"module","exports":"./index.js"}\n',
+        )
+        write(trusted, "web/node_modules/typescript/index.js", "export {};\n")
+
+        def branch(name: str, change) -> tuple[Path, str]:
+            candidate = root / name
+            git(repo, "worktree", "add", "-q", "-b", name, str(candidate), branch_point)
+            change(candidate)
+            head = commit(candidate, name)
+            tree = git(repo, "merge-tree", "--write-tree", main, head).decode().split("\n")[0]
+            return candidate, tree
+
+        def check(candidate: Path, *extra: str) -> subprocess.CompletedProcess[bytes]:
+            return run(
+                [
+                    "node",
+                    str(trusted / "web/scripts/check-complexity.mjs"),
+                    "--repo-root",
+                    str(candidate),
+                    "--tool-root",
+                    str(trusted),
+                    *extra,
+                ],
+                check=False,
+            )
+
+        # A stale branch that leaves the trusted files alone.
+        stale, stale_tree = branch("stale", lambda path: write(path, "README.md", "docs\n"))
+        result = check(stale)
+        assert result.returncode == 2, "without a merge the stale head is compared strictly"
+        assert b"is a trusted policy file" in result.stderr
+        result = check(stale, "--merge-repo", str(repo / ".git"), "--merge-tree", stale_tree)
+        # Past the trusted-file gate, the next check reads the complexity config,
+        # which this fixture does not provide.
+        assert b".oxlintrc.json" in result.stderr, result.stderr
+
+        # A branch that edits a trusted file main did not touch.
+        edited, edited_tree = branch(
+            "edited",
+            lambda path: write(path, ".github/workflows/web-complexity-trusted.yml", "edit\n"),
+        )
+        result = check(edited, "--merge-repo", str(repo / ".git"), "--merge-tree", edited_tree)
+        assert result.returncode == 2
+        assert b".github/workflows/web-complexity-trusted.yml is a trusted policy file" in result.stderr
+
+        # A symlink to identical content is not the trusted file.
+        def symlink_workflow(path: Path) -> None:
+            write(path, "web/copy.yml", "old\n")
+            workflow = path / ".github/workflows/web-complexity-trusted.yml"
+            workflow.unlink()
+            workflow.symlink_to("../../web/copy.yml")
+
+        linked, linked_tree = branch("linked", symlink_workflow)
+        result = check(linked, "--merge-repo", str(repo / ".git"), "--merge-tree", linked_tree)
+        assert result.returncode == 2
+        assert b".github/workflows/web-complexity-trusted.yml is a trusted policy file" in result.stderr
+
+        # The same bytes with a different mode are not the trusted file either.
+        def make_executable(path: Path) -> None:
+            (path / ".github/workflows/web-complexity-trusted.yml").chmod(0o755)
+
+        mode, mode_tree = branch("mode", make_executable)
+        result = check(mode, "--merge-repo", str(repo / ".git"), "--merge-tree", mode_tree)
+        assert result.returncode == 2
+        assert b".github/workflows/web-complexity-trusted.yml is a trusted policy file" in result.stderr
+    finally:
+        temp.cleanup()
+
+
+MERGE_STEP = "Merge pull request into its base for the trusted-file check"
+MERGE_UPSTREAM = 'upstream="https://github.com/${GITHUB_REPOSITORY}.git"'
+
+
+def test_merge_step_merges_only_when_rebase_merging_is_off() -> None:
+    steps = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))["jobs"]["complexity"]["steps"]
+    script = next(step["run"] for step in steps if step.get("name") == MERGE_STEP)
+    assert script.count(MERGE_UPSTREAM) == 1, "the merge step must fetch from the upstream repository"
+    script = script.replace(MERGE_UPSTREAM, 'upstream="$TEST_UPSTREAM"')
+
+    temp = tempfile.TemporaryDirectory()
+    try:
+        root = Path(temp.name)
+        repo = root / "upstream"
+        repo.mkdir()
+        git(repo, "init", "-q", "-b", "main")
+        git(repo, "config", "user.email", "ci@example.com")
+        git(repo, "config", "user.name", "CI")
+        git(repo, "config", "uploadpack.allowFilter", "true")
+        git(repo, "config", "uploadpack.allowAnySHA1InWant", "true")
+        write(repo, "scripts/ci/scope-web-complexity.py", "old\n")
+        write(repo, "web/scripts/check-complexity.mjs", "checker\n")
+        write(repo, ".github/workflows/web-complexity-trusted.yml", "workflow\n")
+        branch_point = commit(repo, "branch point")
+        write(repo, "scripts/ci/scope-web-complexity.py", "fixed\n")
+        commit(repo, "main fixes the scoper")
+
+        # A stale branch that never touches the trusted files.
+        git(repo, "checkout", "-q", "-b", "stale", branch_point)
+        write(repo, "README.md", "docs\n")
+        stale = commit(repo, "docs")
+
+        # A branch that merged main after main changed a trusted file, as
+        # "Update branch" does, before main changed it again.
+        git(repo, "checkout", "-q", "-b", "updated", stale)
+        git(repo, "merge", "-q", "--no-edit", "main")
+        updated = git(repo, "rev-parse", "HEAD").decode().strip()
+        git(repo, "checkout", "-q", "main")
+        write(repo, "scripts/ci/scope-web-complexity.py", "fixed again\n")
+        main = commit(repo, "main fixes the scoper again")
+
+        # The step asks the repository whether rebase merging is allowed.
+        stub = root / "bin"
+        stub.mkdir()
+        # The stub answers only the exact query the gate depends on, so a
+        # changed field, owner, name or jq path fails like a broken API.
+        write(
+            stub,
+            "gh",
+            "#!/bin/sh\n"
+            'case "$*" in\n'
+            "  'api graphql -f owner=example -f name=repo -f query=query($owner: String!, $name: String!) "
+            "{ repository(owner: $owner, name: $name) { rebaseMergeAllowed } } "
+            "--jq .data.repository.rebaseMergeAllowed') ;;\n"
+            '  *) echo "unexpected gh call: $*" >&2; exit 2 ;;\n'
+            "esac\n"
+            # Real gh prints the error body on stdout when a request fails.
+            '[ "$GH_STUB" = fail ] && { echo \'{"message":"Bad credentials"}\'; exit 1; }\n'
+            'echo "$GH_STUB"\n',
+        )
+        (stub / "gh").chmod(0o755)
+
+        def run_step(head: str, rebase: str) -> dict[str, str]:
+            label = f"{head[:7]}-{rebase}"
+            output = root / f"output-{label}"
+            runner_temp = root / f"runner-{label}"
+            runner_temp.mkdir()
+            output.touch()
+            run(
+                ["bash", "-c", script],
+                env={
+                    "PATH": f"{stub}:/usr/bin:/bin:/usr/local/bin",
+                    "HOME": str(root),
+                    "GITHUB_OUTPUT": str(output),
+                    "GITHUB_REPOSITORY": "example/repo",
+                    "RUNNER_TEMP": str(runner_temp),
+                    "TRUSTED_SHA": main,
+                    "CANDIDATE_SHA": head,
+                    "TEST_UPSTREAM": f"file://{repo}",
+                    "GH_STUB": rebase,
+                },
+            )
+            return dict(line.split("=", 1) for line in output.read_text().splitlines() if "=" in line)
+
+        def merged_tree(head: str) -> str:
+            return git(repo, "merge-tree", "--write-tree", main, head).decode().split("\n")[0]
+
+        # A rebase merge replays commits one by one, so the merge of the head
+        # does not describe what lands. The step must stay strict.
+        assert run_step(stale, "true") == {}, "rebase merging allowed: compare strictly"
+        assert run_step(stale, "fail") == {}, "unknown setting: compare strictly"
+
+        assert run_step(stale, "false").get("tree") == merged_tree(stale)
+        assert run_step(updated, "false").get("tree") == merged_tree(updated), (
+            "a branch that merged main is judged by its merge"
+        )
+    finally:
+        temp.cleanup()
+
+
 def test_checker_baseline_ratchet() -> None:
     if shutil.which("node") is None:
         raise AssertionError("node is required for the checker ratchet regression")
@@ -641,6 +846,151 @@ def test_checker_baseline_ratchet() -> None:
     finally:
         temp.cleanup()
 
+
+
+TRIGGER_PATHS = [
+    "web/**",
+    ".github/workflows/web-complexity.yml",
+    ".github/workflows/web-complexity-trusted.yml",
+    "scripts/ci/scope-web-complexity.py",
+    "scripts/ci/web_complexity_scope.py",
+]
+
+
+def test_pull_request_target_queues_only_for_web_or_policy_changes() -> None:
+    """A pull request that touches no web/ source or complexity policy starts no run.
+
+    "Web complexity" is not a required check on main, so a path filter cannot
+    strand a pull request on an expected check. GitHub evaluates the filter on
+    the pull request's own diff (against the merge base), so a stale branch
+    that touches no web file is not queued because main changed web/.
+    """
+    document = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
+    events = document.get("on", document.get(True))
+    assert events["pull_request_target"].get("paths") == TRIGGER_PATHS, (
+        "pull_request_target must queue only for web/** and complexity policy changes"
+    )
+
+
+def _step_run(name: str) -> tuple[str, dict]:
+    document = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
+    step = next(step for step in document["jobs"]["complexity"]["steps"] if step.get("name") == name)
+    return step["run"], step.get("env", {})
+
+
+def _stale_branch_fixture(pr_change) -> tuple[Path, dict[str, str], tempfile.TemporaryDirectory[str]]:
+    """main advanced (web source and the baseline changed) after the PR branched.
+
+    Returns the workspace (trusted/ and candidate/ checkouts as the workflow
+    lays them out) and the step environment.
+    """
+    temp = tempfile.TemporaryDirectory()
+    root = Path(temp.name)
+    upstream = root / "upstream"
+    upstream.mkdir()
+    git(upstream, "init", "-q", "-b", "main")
+    git(upstream, "config", "user.email", "ci@example.com")
+    git(upstream, "config", "user.name", "CI")
+    git(upstream, "config", "commit.gpgsign", "false")
+    write(upstream, BASELINE, BASELINE_ENTRY)
+    write(upstream, "web/app/debt.ts", "export const debt = 1;\n")
+    write(upstream, "README.md", "base\n")
+    commit(upstream, "branch point")
+    git(upstream, "checkout", "-q", "-b", "pr")
+    pr_change(upstream)
+    head = commit(upstream, "pull request change")
+    git(upstream, "checkout", "-q", "main")
+    # Main moves on: a web source edit and a baseline cleanup the PR never saw.
+    write(upstream, "web/app/other.ts", "export const other = 2;\n")
+    write(upstream, BASELINE, "")
+    trusted_sha = commit(upstream, "main moves on")
+
+    workspace = root / "workspace"
+    workspace.mkdir()
+    run(["git", "clone", "-q", "--depth=1", "--branch", "pr", upstream.as_uri(), str(workspace / "candidate")])
+    # As on a runner: the shallow candidate holds main's tip but no history
+    # down to the merge base.
+    git(workspace / "candidate", "fetch", "-q", "--depth=1", upstream.as_uri(), "main")
+    run(["git", "clone", "-q", upstream.as_uri(), str(workspace / "trusted")])
+    git(workspace / "trusted", "checkout", "-q", trusted_sha)
+    scripts = workspace / "trusted" / "scripts" / "ci"
+    scripts.mkdir(parents=True, exist_ok=True)
+    shutil.copy(SCOPER, scripts / "scope-web-complexity.py")
+    output = root / "github-output.txt"
+    output.write_text("", encoding="utf-8")
+    env = {
+        "PATH": __import__("os").environ["PATH"],
+        "HOME": str(root),
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GITHUB_WORKSPACE": str(workspace),
+        "GITHUB_OUTPUT": str(output),
+        "RUNNER_TEMP": str(root),
+        "TRUSTED_SHA": trusted_sha,
+        "CANDIDATE_SHA": head,
+        "UPSTREAM_REPOSITORY": "fixture/unused",
+        "UPSTREAM_URL": upstream.as_uri(),
+    }
+    return workspace, env, temp
+
+
+def _outputs(env: dict[str, str]) -> dict[str, str]:
+    outputs: dict[str, str] = {}
+    for line in Path(env["GITHUB_OUTPUT"]).read_text(encoding="utf-8").splitlines():
+        key, value = line.split("=", 1)
+        outputs[key] = value
+    return outputs
+
+
+def _run_step(name: str, workspace: Path, env: dict[str, str]) -> subprocess.CompletedProcess[bytes]:
+    script, step_env = _step_run(name)
+    full_env = dict(env)
+    for key, value in step_env.items():
+        if "${{" not in str(value):
+            full_env[key] = str(value)
+    if "steps.scope.outputs.diff_base" in str(step_env.get("DIFF_BASE", "")):
+        full_env["DIFF_BASE"] = _outputs(env).get("diff_base", "")
+    return run(["bash", "-e", "-c", script], cwd=workspace, env=full_env, check=False)
+
+
+def test_stale_branch_without_web_changes_skips_the_scan() -> None:
+    """The pull request's own changes decide the scope, not main's later commits.
+
+    2026-10-06 20:00Z: the compare API hit the installation rate limit, the
+    local fallback diffed main's tip against a stale head (two-dot), counted
+    155 of main's own web changes as the PR's, and the full scan of the stale
+    head failed 357 runs on code main had already fixed.
+    """
+    workspace, env, temp = _stale_branch_fixture(
+        lambda repo: write(repo, "Sources/App.swift", "let answer = 42\n"))
+    try:
+        result = _run_step("Select complexity work before installing Bun", workspace, env)
+        assert result.returncode == 0, result.stderr.decode("utf-8", errors="replace")
+        assert _outputs(env).get("run") == "false", (
+            _outputs(env), result.stdout.decode("utf-8", errors="replace"))
+    finally:
+        temp.cleanup()
+
+
+def test_stale_branch_web_change_scans_only_its_own_files() -> None:
+    """A stale branch that edits one web file scans that file, not a full scan.
+
+    Main's baseline cleanup after the branch point is not the pull request's
+    policy change, so it must not force the conservative full scan of the
+    stale head.
+    """
+    workspace, env, temp = _stale_branch_fixture(
+        lambda repo: write(repo, "web/app/page.tsx", "export const value = 2;\n"))
+    try:
+        result = _run_step("Select complexity work before installing Bun", workspace, env)
+        assert result.returncode == 0, result.stderr.decode("utf-8", errors="replace")
+        assert _outputs(env).get("run") == "true", _outputs(env)
+        result = _run_step("Determine pull-request complexity scope", workspace, env)
+        assert result.returncode == 0, result.stderr.decode("utf-8", errors="replace")
+        outputs = _outputs(env)
+        assert outputs.get("mode") == "changed", (outputs, result.stdout.decode("utf-8", errors="replace"))
+        assert outputs.get("selected_count") == "1", outputs
+    finally:
+        temp.cleanup()
 
 
 
@@ -717,7 +1067,12 @@ def main() -> int:
     test_policy_symlink_fails_closed()
     test_selected_symlink_fails_closed()
     test_checker_protects_trusted_scoper()
+    test_checker_judges_trusted_files_in_the_merge()
+    test_merge_step_merges_only_when_rebase_merging_is_off()
     test_checker_baseline_ratchet()
+    test_pull_request_target_queues_only_for_web_or_policy_changes()
+    test_stale_branch_without_web_changes_skips_the_scan()
+    test_stale_branch_web_change_scans_only_its_own_files()
     print("PASS: trusted web complexity scopes work before Bun and runs checks from the trusted checkout")
     return 0
 

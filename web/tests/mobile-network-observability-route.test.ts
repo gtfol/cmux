@@ -3,6 +3,7 @@ import type { checkRateLimit as checkVercelRateLimit } from "@vercel/firewall";
 
 import { makeMobileNetworkOutcomeHandler } from "../app/api/observability/mobile-network/route";
 import type { MobileObservabilityEvent } from "../services/observability/mobileNetworkOutcome";
+import { feedPerformanceWindow } from "./fixtures/mobile-feed-performance";
 
 const originalVercel = process.env.VERCEL;
 const originalRuleId = process.env.CMUX_MOBILE_OBSERVABILITY_RATE_LIMIT_ID;
@@ -54,6 +55,15 @@ afterAll(() => {
 });
 
 describe("iOS mobile network observability route", () => {
+  test("accepts a Feed window in the existing authenticated, rate-limited batch", async () => {
+    const response = await POST(outcomeRequest([feedPerformanceWindow()]));
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ ok: true, accepted: 1 });
+    expect(emitted[0]?.userId).toBe("user-7");
+    expect(emitted[0]?.batch[0]).toMatchObject({ feedEvent: true, event: "ios_feed_performance_window" });
+    expect(flushTimeouts).toEqual([1_000]);
+  });
+
   test("attributes an accepted failure batch to the authenticated user", async () => {
     const response = await POST(outcomeRequest([
       outcome({
@@ -106,6 +116,149 @@ describe("iOS mobile network observability route", () => {
     expect(response.status).toBe(200);
     expect(emitted[0]?.batch[0]).toMatchObject({ phase: "rpc_ready", durationMs: 890 });
     expect(flushTimeouts).toEqual([1_000]);
+  });
+
+  test("accepts Iroh path lifecycle events for route selection evidence", async () => {
+    const response = await POST(outcomeRequest([{
+      event: "ios_iroh_path_event",
+      timestamp: "2026-09-04T12:00:00.000Z",
+      properties: {
+        operation: "selected",
+        path: "private_network",
+        transport: "iroh",
+        event_code: "transportPathEvent",
+        event_code_raw: 55,
+        event_surface: 8,
+        event_a: 3,
+        event_b: 3,
+        event_c: 23,
+        platform: "ios",
+      },
+    }]));
+
+    expect(response.status).toBe(200);
+    expect(emitted[0]?.batch[0]).toMatchObject({
+      operation: "selected",
+      path: "private_network",
+      transport: "iroh",
+      eventCode: "transportPathEvent",
+      eventCodeRaw: 55,
+      eventSurface: 8,
+      eventA: 3,
+      eventB: 3,
+      eventC: 23,
+    });
+  });
+
+  test("distinguishes an initial Iroh path snapshot from a native selection change", async () => {
+    const response = await POST(outcomeRequest([{
+      event: "ios_iroh_path_event",
+      timestamp: "2026-09-04T12:00:00.000Z",
+      properties: {
+        operation: "snapshot", path: "relay", transport: "iroh",
+        event_code: "selectedPathChanged", event_code_raw: 40,
+        event_surface: 8, event_a: 2, event_c: 23, platform: "ios",
+      },
+    }]));
+    expect(response.status).toBe(200);
+    expect(emitted[0]?.batch[0]).toMatchObject({ operation: "snapshot", path: "relay" });
+  });
+
+  test("accepts native Iroh path inventory counts without addresses", async () => {
+    const response = await POST(outcomeRequest([{
+      event: "ios_iroh_path_inventory",
+      timestamp: "2026-09-04T12:00:00.000Z",
+      properties: {
+        operation: "inventory",
+        transport: "iroh",
+        relay_path_count: 1,
+        non_relay_path_count: 2,
+        path_count: 3,
+        event_code: "transportPathInventory",
+        event_code_raw: 83,
+        event_surface: 8,
+        event_a: 1,
+        event_b: 2,
+        event_c: 23,
+        platform: "ios",
+      },
+    }]));
+
+    expect(response.status).toBe(200);
+    expect(emitted[0]?.batch[0]).toMatchObject({
+      operation: "inventory",
+      transport: "iroh",
+      relayPathCount: 1,
+      nonRelayPathCount: 2,
+      pathCount: 3,
+      eventCode: "transportPathInventory",
+      eventCodeRaw: 83,
+      eventC: 23,
+    });
+  });
+
+  test("rejects an Iroh path inventory whose aggregate exceeds the bound", async () => {
+    const response = await POST(outcomeRequest([{
+      event: "ios_iroh_path_inventory",
+      timestamp: "2026-09-04T12:00:00.000Z",
+      properties: {
+        operation: "inventory",
+        transport: "iroh",
+        relay_path_count: 64,
+        non_relay_path_count: 64,
+        path_count: 128,
+        event_code: "transportPathInventory",
+        event_code_raw: 83,
+        platform: "ios",
+      },
+    }]));
+
+    expect(response.status).toBe(400);
+    expect(emitted).toEqual([]);
+  });
+
+  test.each([
+    ["raw event code", { event_code_raw: 40 }],
+    ["lifecycle operation", { operation: "opened" }],
+    ["path class", { path: "relay" }],
+    ["missing operation slot", { event_a: undefined }],
+    ["missing path slot", { event_b: undefined }],
+    ["snapshot raw code", { event_code: "selectedPathChanged", operation: "snapshot" }],
+    ["snapshot operation", { event_code: "selectedPathChanged", event_code_raw: 40 }],
+    ["snapshot path slot", { event_code: "selectedPathChanged", event_code_raw: 40, operation: "snapshot", event_a: 2 }],
+    ["lag marker with a known path", { operation: "lagged", event_a: 4 }],
+  ] as const)("rejects an Iroh event with inconsistent %s", async (_, overrides) => {
+    const response = await POST(outcomeRequest([{
+      event: "ios_iroh_path_event",
+      timestamp: "2026-09-04T12:00:00.000Z",
+      properties: {
+        operation: "selected", path: "private_network", transport: "iroh",
+        event_code: "transportPathEvent", event_code_raw: 55,
+        event_a: 3, event_b: 3, event_c: 23, platform: "ios",
+        ...overrides,
+      },
+    }]));
+    expect(response.status).toBe(400);
+    expect(emitted).toEqual([]);
+  });
+
+  test.each([
+    ["opened", 1, "direct", 1],
+    ["closed", 2, "relay", 2],
+    ["selected", 3, "loopback", 4],
+    ["lagged", 4, "unknown", 0],
+  ] as const)("accepts consistent Iroh %s events", async (operation, operationCode, path, pathCode) => {
+    const response = await POST(outcomeRequest([{
+      event: "ios_iroh_path_event",
+      timestamp: "2026-09-04T12:00:00.000Z",
+      properties: {
+        operation, path, transport: "iroh",
+        event_code: "transportPathEvent", event_code_raw: 55,
+        event_a: operationCode, event_b: pathCode, event_c: 23, platform: "ios",
+      },
+    }]));
+    expect(response.status).toBe(200);
+    expect(emitted[0]?.batch[0]).toMatchObject({ operation, path });
   });
 
   test("accepts task model discovery failures for Axiom root-cause spans", async () => {
@@ -195,6 +348,52 @@ describe("iOS mobile network observability route", () => {
       inputToVisibleP95Ms: 86,
       renderP99Ms: 12,
     });
+  });
+
+  test("accepts per-hop stage histograms and pacer counters when present", async () => {
+    const event = terminalWindow();
+    const properties = event.properties as Record<string, unknown>;
+    const counts = JSON.stringify([0, 0, 0, 0, 0, 0, 1, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    Object.assign(properties, {
+      histogram_version: 1,
+      input_to_output_histogram: counts,
+      input_to_visible_histogram: counts,
+      render_histogram: counts,
+      uplink_histogram: counts,
+      uplink_p50_ms: 128,
+      uplink_p95_ms: 128,
+      uplink_p99_ms: 128,
+      pacer_period_histogram: counts,
+      pacer_sample_count: 3,
+      pacer_emitted_count: 33,
+      pacer_coalesced_count: 48,
+      pacer_shed_count: 1,
+      pacer_period_max_ms: 135,
+    });
+    const response = await POST(outcomeRequest([event]));
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ ok: true, accepted: 1 });
+    expect(emitted[0]?.batch[0]).toMatchObject({
+      histograms: { uplink: counts, pacer_period: counts },
+      stageMetrics: { uplink_p95_ms: 128, pacer_coalesced_count: 48, pacer_period_max_ms: 135 },
+    });
+  });
+
+  test("rejects a malformed per-hop stage histogram", async () => {
+    const event = terminalWindow();
+    const counts = JSON.stringify(Array(17).fill(0));
+    Object.assign(event.properties as Record<string, unknown>, {
+      histogram_version: 1,
+      input_to_output_histogram: counts,
+      input_to_visible_histogram: counts,
+      render_histogram: counts,
+      downlink_histogram: "[1,2]",
+    });
+    const response = await POST(outcomeRequest([event]));
+
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({ error: "invalid_outcome" });
   });
 
   test("accepts a terminal anomaly as a failure signal", async () => {

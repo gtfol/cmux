@@ -9,13 +9,16 @@ replace Swift's task allocator. No source-text assertions or timing sleeps.
 import os
 from pathlib import Path
 import platform
+import re
 import subprocess
 import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parent.parent
 FIXTURE = ROOT / "tests/cloud_task_local"
-CLOUD = ROOT / "Sources/Cloud"
+CLOUD = ROOT / "Packages/macOS/CmuxCloud/Sources/CmuxCloud"
+# The shared reference carrier, compiled as its own module like the app links it.
+TASK_LOCAL_REFERENCE = ROOT / "Packages/macOS/CmuxFoundation/Sources/CmuxFoundation/Concurrency/TaskLocalReference.swift"
 
 
 @unittest.skipUnless(platform.system() == "Darwin", "requires the macOS Swift runtime")
@@ -34,22 +37,36 @@ class CloudTaskLocalLifecycleTests(unittest.TestCase):
             "-o", str(directory / "auth.o"),
         ], check=True)
         subprocess.run([
+            "xcrun", "swiftc", "-target", target, "-swift-version", "6", "-warnings-as-errors", "-O",
+            "-emit-module", "-emit-object", "-parse-as-library", "-module-name", "CmuxFoundation",
+            str(TASK_LOCAL_REFERENCE), "-emit-module-path", str(directory / "CmuxFoundation.swiftmodule"),
+            "-o", str(directory / "foundation.o"),
+        ], check=True)
+        subprocess.run([
             "xcrun", "clang", "-target", target, "-Werror", "-c",
             str(FIXTURE / "LegacyAvailability.c"), "-o", str(directory / "legacy.o"),
         ], check=True)
         cls.binary = directory / "cloud-task-local-probe"
         production = [
-            "CloudOperationContext.swift", "CloudOperationRecorder.swift",
-            "CloudOperationKind.swift", "CloudOperationPhase.swift",
-            "CloudOperationSnapshot.swift", "CloudRemoteOperationStep.swift",
-            "CloudTelemetrySpan.swift", "CloudTelemetrySending.swift",
+            "Operations/CloudOperationContext.swift", "Operations/CloudOperationRecorder.swift",
+            "Operations/CloudOperationKind.swift", "Operations/CloudOperationPhase.swift",
+            "Operations/CloudOperationSnapshot.swift", "Operations/CloudRemoteOperationStep.swift",
+            "Telemetry/CloudTelemetrySpan.swift", "Telemetry/CloudTelemetrySending.swift",
+            "Telemetry/CloudTelemetryAuthAttributes.swift",
         ]
+        # The package's public API names the stubbed collaborators, which are
+        # internal here; one module needs no access modifiers.
+        copies = directory / "production"
+        copies.mkdir()
+        for source in production:
+            text = (CLOUD / source).read_text()
+            (copies / Path(source).name).write_text(re.sub(r"\bpublic ", "", text))
         subprocess.run([
             "xcrun", "swiftc", *flags, "-O", "-whole-module-optimization", "-g", "-parse-as-library",
             "-module-name", "CloudTaskLocalRegression", "-I", str(directory),
-            *[str(CLOUD / source) for source in production],
+            *[str(copies / Path(source).name) for source in production],
             str(FIXTURE / "Dependencies.swift"), str(FIXTURE / "Probe.swift"),
-            str(directory / "auth.o"), str(directory / "legacy.o"),
+            str(directory / "auth.o"), str(directory / "foundation.o"), str(directory / "legacy.o"),
             "-o", str(cls.binary),
         ], check=True)
 

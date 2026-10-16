@@ -1,3 +1,4 @@
+import CmuxCloud
 import CmuxComputerUse
 import AppKit
 import CmuxAppKitSupportUI
@@ -15,23 +16,17 @@ import Darwin
 import Bonsplit
 import UniformTypeIdentifiers
 import CmuxTerminal
-
 struct cmuxApp: App {
-    /// Dependency container for the new settings packages. Constructed
-    /// once at app launch and injected into the SwiftUI environment via
-    /// `.settingsRuntime(_:)`; descendant views resolve their settings
-    /// through it via the `@LiveSetting` property wrapper.
+    /// App-owned settings graph, injected into each SwiftUI hosting root.
     private let settingsRuntime: SettingsRuntime
-
     /// Single owner of the independently launched Computer Use helper daemon.
     private let computerUseRuntimeService: ComputerUseRuntimeService
 
-    /// The de-singletonized auth graph (shared AuthCoordinator + the macOS
-    /// hosted-browser sign-in flow). Constructed once at app launch and
-    /// injected into AppDelegate and the auth-consuming services.
+    /// App-owned auth graph injected into the delegate and auth consumers.
     private let authComposition: MacAuthComposition
     /// Composition-root owner for the config-backed automation bridge.
     private let automationEngine: AutomationEngine
+    private let browserDataImportCoordinator: BrowserDataImportCoordinator
     @StateObject private var tabManager: TabManager
     @StateObject private var notificationStore: TerminalNotificationStore
     @StateObject var closedItemHistoryStore: ClosedItemHistoryStore
@@ -43,7 +38,11 @@ struct cmuxApp: App {
     private var showSidebarDevBuildBanner = DevBuildBannerDebugSettings.defaultShowSidebarBanner
     @AppStorage(SocketControlSettings.appStorageKey) private var socketControlMode = SocketControlSettings.defaultMode.rawValue
     @AppStorage(BrowserToolbarAccessorySpacingDebugSettings.key) private var browserToolbarAccessorySpacingRaw = BrowserToolbarAccessorySpacingDebugSettings.defaultSpacing
+    @AppStorage(SettingCatalog().betaFeatures.remoteTmuxNewWorkspaceOnHost.userDefaultsKey)
+    private var remoteTmuxNewWorkspaceOnHostEnabled = SettingCatalog().betaFeatures.remoteTmuxNewWorkspaceOnHost.defaultValue
+    @State private var aboutWindowController: AboutWindowController?
     @State private var browserFocusModeMenuRevision = 0
+    @State private var browserAvailabilityMenuRevision = 0
     @State var historyMenuCoordinator: HistoryMenuCoordinator
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     private var browserToolbarAccessorySpacing: Int {
@@ -99,10 +98,12 @@ struct cmuxApp: App {
             backupTimestamp: secretMigrationTimestamp
         )
         let authComposition = MacAuthComposition()
+        let browserDataImportCoordinator = BrowserDataImportCoordinator()
         let notificationStore = TerminalNotificationStore.shared
         let closedItemHistoryStore = ClosedItemHistoryStore.shared
         let sidebarState = SidebarState()
         self.authComposition = authComposition
+        self.browserDataImportCoordinator = browserDataImportCoordinator
 
         // If invoked with CLI-style arguments (e.g. `cmux hooks setup`), exec the
         // bundled CLI at Contents/Resources/bin/cmux. The GUI binary and the CLI
@@ -160,8 +161,9 @@ struct cmuxApp: App {
         )
         // Codex app approval authenticates the MCP broker as the exact
         // executable already serving this cmux-owned helper generation.
-        // Export the installed helper path rather than the separately signed
-        // Resources/bin client; the wrapper validates the path before use.
+        // Both agent wrappers use this installed helper as their MCP client;
+        // the app ships no other cmux-cua copy, and the wrappers validate the
+        // path before use.
         setenv(
             ComputerUseRuntimePaths.clientExecutableEnvironmentKey,
             computerUsePaths.installedHelperExecutableURL.path,
@@ -182,11 +184,22 @@ struct cmuxApp: App {
         StartupBreadcrumbLog.append("app.init.keyboardShortcuts.loaded")
 
         // Reconcile saved language preference before any UI loads
-        LanguageSettingsStore(defaults: .standard).reconcileLanguageOverrideAtLaunch()
+        LanguageSettingsStore(defaults: .standard, domainName: ProcessDefaultsDomain.name).reconcileLanguageOverrideAtLaunch()
         StartupBreadcrumbLog.append("app.init.language.applied")
         let devices = MacDevicesComposition(defaults: .standard, catalog: settingsCatalog)
         let devicesRegistry = devices.registry
         let computersService = devices.computers
+        let hostSettingsActions = HostSettingsActions(
+            configFileURL: configFileURL,
+            computerUseRuntimeService: computerUseRuntimeService,
+            browserDataImportCoordinator: browserDataImportCoordinator,
+            computersActions: devices.settingsActions,
+            runComputerUseOnboardingAction: { startingPoint in
+                AppDelegate.shared?.computerUseUXCoordinator.presentOnboardingFromSettings(
+                    startingAt: startingPoint
+                )
+            }
+        )
         self.settingsRuntime = SettingsRuntime(
             catalog: settingsCatalog,
             userDefaultsStore: devices.defaultsStore,
@@ -194,16 +207,7 @@ struct cmuxApp: App {
             secretStore: secretStore,
             errorLog: SettingsErrorLog(),
             accountFlow: authComposition.accountFlow,
-            hostActions: HostSettingsActions(
-                configFileURL: configFileURL,
-                computerUseRuntimeService: computerUseRuntimeService,
-                computersActions: devices.settingsActions,
-                runComputerUseOnboardingAction: { startingPoint in
-                    AppDelegate.shared?.computerUseUXCoordinator.presentOnboardingFromSettings(
-                        startingAt: startingPoint
-                    )
-                }
-            ),
+            hostActions: hostSettingsActions,
             shortcutDefaultResolver: Self.makeShortcutDefaultResolver()
         )
         StartupBreadcrumbLog.append("app.init.settingsRuntime.created")
@@ -212,6 +216,7 @@ struct cmuxApp: App {
         Self.applyAppearance(startupAppearance, duringLaunch: true)
         StartupBreadcrumbLog.append("app.init.appearance.applied", fields: ["mode": startupAppearance.rawValue])
         let defaults = UserDefaults.standard
+        CmuxExtensionSidebarSelection.clearStaleTemplatePreviewSelection(defaults: defaults)
         TerminalController.shared.prepareControlHandleRegistryForLaunch(defaults: defaults)
         let workspaceCustomizationStore = WorkspaceCustomizationStore(
             defaults: defaults
@@ -295,6 +300,8 @@ struct cmuxApp: App {
             StartupBreadcrumbLog.append("app.init.keychainMigration.complete")
         }
         migrateSidebarAppearanceDefaultsIfNeeded(defaults: defaults)
+        MinimalModeTitlebarDebugSettings.migrateLegacyKeysIfNeeded(defaults: defaults)
+        CmuxExtensionSidebarSelection.migrateLegacyDefaultsKeyIfNeeded(defaults: defaults)
         StartupBreadcrumbLog.append("app.init.sidebarDefaults.migrated")
 
         // UI tests need AppDelegate wiring even if SwiftUI appearance callbacks are skipped.
@@ -313,10 +320,12 @@ struct cmuxApp: App {
             cloudWorkspaceOperationController: cloudWorkspaceOperationController,
             newMachineSheetPresenter: NewMachineSheetPresenter.shared,
             automationEngine: automationEngine,
+            browserDataImportCoordinator: browserDataImportCoordinator,
             computerUseRuntimeService: computerUseRuntimeService,
             devicesRegistry: devicesRegistry,
             computersService: computersService
         )
+        hostSettingsActions.cloudActivationCoordinator = appDelegate.cloudActivationCoordinator
         historyMenuCoordinator.refreshIfNeeded()
         StartupBreadcrumbLog.append("app.init.delegate.configured")
     }
@@ -505,12 +514,24 @@ struct cmuxApp: App {
                 .onReceive(NotificationCenter.default.publisher(for: .browserFocusModeStateDidChange)) { _ in
                     browserFocusModeMenuRevision &+= 1
                 }
+                // `BrowserAvailabilityMonitor` owns watching the gate's
+                // entrypoints, so the menus follow that one signal and
+                // re-evaluate on a real change instead of on every defaults
+                // write.
+                .onReceive(NotificationCenter.default.publisher(for: BrowserAvailabilityMonitor.didChangeNotification)) { _ in
+                    browserAvailabilityMenuRevision &+= 1
+                }
         }
         .windowStyle(.hiddenTitleBar)
         .commands {
             CommandGroup(replacing: .appSettings) {
                 splitCommandButton(title: String(localized: "menu.app.settings", defaultValue: "Settings…"), shortcut: menuShortcut(for: .openSettings)) {
                     appDelegate.openPreferencesWindow(debugSource: "menu.cmdComma")
+                }
+                Button(AppDelegate.actionsAndLaunchersMenuTitle) {
+                    appDelegate.presentActionsAndLaunchersCustomization(
+                        preferredWindow: NSApp.keyWindow ?? NSApp.mainWindow
+                    )
                 }
                 Button(String(localized: "menu.app.openCmuxSettingsFile", defaultValue: "Open cmux.json")) {
                     openCmuxSettingsFileInEditor()
@@ -546,7 +567,7 @@ struct cmuxApp: App {
 
             CommandGroup(replacing: .appTermination) {
                 splitCommandButton(title: String(localized: "menu.quitCmux", defaultValue: "Quit cmux"), shortcut: menuShortcut(for: .quit)) {
-                    NSApp.terminate(nil)
+                    AppDelegate.requestApplicationTermination()
                 }
             }
 
@@ -869,24 +890,40 @@ struct cmuxApp: App {
                     if let appDelegate = AppDelegate.shared {
                         appDelegate.performNewWorkspaceAction(
                             tabManager: activeTabManager,
-                            debugSource: "menu.newWorkspace"
+                            debugSource: "menu.newWorkspace",
+                            localOnly: true
                         )
                     } else {
                         activeTabManager.addWorkspaceIfActive()
                     }
                 }
 
-                splitCommandButton(title: String(localized: "menu.file.newBrowserWorkspace", defaultValue: "New Browser Workspace"), shortcut: menuShortcut(for: .newBrowserWorkspace)) {
-                    if let appDelegate = AppDelegate.shared {
-                        appDelegate.performNewBrowserWorkspaceAction(
+                // In a remote-tmux mirror window, plain New Workspace (above) spawns a
+                // tmux session on the window's host, leaving no way to open LOCAL work
+                // there. Offer an explicit escape hatch, shown only when New Workspace
+                // would go remote so it never clutters ordinary windows.
+                if newLocalWorkspaceMenuItemVisible {
+                    splitCommandButton(title: String(localized: "menu.file.newLocalWorkspace", defaultValue: "New Local Workspace"), shortcut: menuShortcut(for: .newLocalWorkspace)) {
+                        AppDelegate.shared?.performNewLocalWorkspaceAction(
                             tabManager: activeTabManager,
-                            debugSource: "menu.newBrowserWorkspace"
+                            debugSource: "menu.newLocalWorkspace"
                         )
-                    } else if BrowserAvailabilitySettings.isEnabled() {
-                        // Last-resort fallback for a missing AppDelegate; keep
-                        // the browser-availability gate identical to the
-                        // shared action path.
-                        activeTabManager.addWorkspaceIfActive(initialSurface: .browser)
+                    }
+                }
+
+                if offersBrowserMenuItems {
+                    splitCommandButton(title: String(localized: "menu.file.newBrowserWorkspace", defaultValue: "New Browser Workspace"), shortcut: menuShortcut(for: .newBrowserWorkspace)) {
+                        if let appDelegate = AppDelegate.shared {
+                            appDelegate.performNewBrowserWorkspaceAction(
+                                tabManager: activeTabManager,
+                                debugSource: "menu.newBrowserWorkspace"
+                            )
+                        } else if BrowserAvailabilitySettings.isEnabled() {
+                            // Last-resort fallback for a missing AppDelegate; keep
+                            // the browser-availability gate identical to the
+                            // shared action path.
+                            activeTabManager.addWorkspaceIfActive(initialSurface: .browser)
+                        }
                     }
                 }
 
@@ -1054,7 +1091,7 @@ struct cmuxApp: App {
                 .cmuxAppearanceColorScheme(appearanceMode)
         }
     }
-
+    /// Presents window navigation and stateful View commands for the focused content.
     @CommandsBuilder
     private var windowAndViewCommands: some Commands {
         CommandGroup(after: .windowArrangement) {
@@ -1064,6 +1101,7 @@ struct cmuxApp: App {
         }
         helpCommands
         historyCommands
+        cloudCommands
         CommandGroup(after: .toolbar) {
             splitCommandButton(title: String(localized: "menu.view.toggleLeftSidebar", defaultValue: "Toggle Left Sidebar"), shortcut: menuShortcut(for: .toggleSidebar)) {
                 // The AppKit-hosted Settings window has no SwiftUI
@@ -1073,6 +1111,15 @@ struct cmuxApp: App {
                 if AppDelegate.shared?.toggleSidebarInActiveMainWindow() != true {
                     sidebarState.toggle()
                 }
+            }
+
+            splitCommandButton(
+                title: String(localized: "shortcut.focusTextBoxInput.label", defaultValue: "Focus TextBox Input"),
+                shortcut: menuShortcut(for: .focusTextBoxInput)
+            ) {
+                _ = AppDelegate.shared?.performFocusTextBoxInputShortcut(
+                    preferredWindow: NSApp.keyWindow ?? NSApp.mainWindow
+                )
             }
 
             splitCommandButton(title: String(localized: "menu.view.toggleRightSidebar", defaultValue: "Toggle Right Sidebar"), shortcut: menuShortcut(for: .toggleRightSidebar)) {
@@ -1160,7 +1207,7 @@ struct cmuxApp: App {
                     _ = activeTabManager.resetZoomFocusedBrowserOrTextFilePreview()
                 }
             }
-
+            FilePreviewWordWrapMenu(shortcut: menuShortcut(for: .toggleFileEditorWordWrap), target: { appDelegate.shortcutFocusedSavingTextView(in: NSApp.keyWindow ?? NSApp.mainWindow) })
             Button(String(localized: "menu.view.clearBrowserHistory", defaultValue: "Clear Browser History")) {
                 BrowserHistoryStore.shared.clearHistory()
             }
@@ -1168,7 +1215,7 @@ struct cmuxApp: App {
             Button(String(localized: "menu.view.importFromBrowser", defaultValue: "Import Browser Data…")) {
                 // Defer modal presentation until after AppKit finishes menu tracking.
                 DispatchQueue.main.async {
-                    BrowserDataImportCoordinator.shared.presentImportDialog()
+                    browserDataImportCoordinator.presentImportDialog()
                 }
             }
 
@@ -1208,12 +1255,14 @@ struct cmuxApp: App {
                 performSplitFromMenu(direction: .down)
             }
 
-            splitCommandButton(title: String(localized: "menu.view.splitBrowserRight", defaultValue: "Split Browser Right"), shortcut: menuShortcut(for: .splitBrowserRight)) {
-                performBrowserSplitFromMenu(direction: .right)
-            }
+            if offersBrowserMenuItems {
+                splitCommandButton(title: String(localized: "menu.view.splitBrowserRight", defaultValue: "Split Browser Right"), shortcut: menuShortcut(for: .splitBrowserRight)) {
+                    performBrowserSplitFromMenu(direction: .right)
+                }
 
-            splitCommandButton(title: String(localized: "menu.view.splitBrowserDown", defaultValue: "Split Browser Down"), shortcut: menuShortcut(for: .splitBrowserDown)) {
-                performBrowserSplitFromMenu(direction: .down)
+                splitCommandButton(title: String(localized: "menu.view.splitBrowserDown", defaultValue: "Split Browser Down"), shortcut: menuShortcut(for: .splitBrowserDown)) {
+                    performBrowserSplitFromMenu(direction: .down)
+                }
             }
 
             paneSizingCommandButtons()
@@ -1264,6 +1313,10 @@ struct cmuxApp: App {
                 AppDelegate.shared?.jumpToLatestUnread()
             }
 
+            splitCommandButton(title: String(localized: "menu.view.jumpToLastPrompt", defaultValue: "Jump to Last Prompt"), shortcut: menuShortcut(for: .jumpToLastPrompt)) {
+                AppDelegate.shared?.jumpToLastPromptFromUserCommand()
+            }
+
             splitCommandButton(title: String(localized: "menu.view.showNotifications", defaultValue: "Show Notifications"), shortcut: menuShortcut(for: .showNotifications)) {
                 showNotificationsPopover()
             }
@@ -1271,7 +1324,16 @@ struct cmuxApp: App {
     }
 
     private func showAboutPanel() {
-        AboutWindowController.shared.show()
+        if aboutWindowController == nil {
+            aboutWindowController = AboutWindowController(
+                acknowledgments: AcknowledgmentsWindowController(),
+                prepareWindow: { [appDelegate] window in appDelegate.applyWindowDecorations(to: window) },
+                prepareTitlebar: { [appDelegate] window in
+                    appDelegate.aboutTitlebarDebugStore.applyCurrentOptions(to: window, for: .about)
+                }
+            )
+        }
+        aboutWindowController?.show()
     }
 
     private func applyAppearance() {
@@ -1313,6 +1375,21 @@ struct cmuxApp: App {
 
     private var notificationMenuSnapshot: NotificationMenuSnapshot {
         notificationStore.notificationMenuSnapshot
+    }
+
+    /// Whether the menus offer their browser-*creating* entries. Reads the
+    /// revision so they re-evaluate when the availability gate changes.
+    ///
+    /// Guards creation only: New Browser Workspace and the browser splits.
+    /// Commands that drive an already-open panel (Back, Reload, developer
+    /// tools) stay visible because the user-level toggle leaves live panels
+    /// open, and so do the zoom commands, which fall back to zooming a focused
+    /// text file preview when no browser is focused (#10866).
+    private var offersBrowserMenuItems: Bool {
+        let _ = browserAvailabilityMenuRevision
+        return BrowserAvailabilitySettings.offersBrowserAffordance(
+            isEnabled: BrowserAvailabilitySettings.isEnabled()
+        )
     }
 
     private var browserFocusModeMenuSnapshot: (title: String, canToggle: Bool) {
@@ -1357,6 +1434,24 @@ struct cmuxApp: App {
         AppDelegate.shared?.activeTabManagerForCommands(
             preferredWindow: NSApp.keyWindow ?? NSApp.mainWindow
         ) ?? tabManager
+    }
+
+    /// Whether the "New Local Workspace" File-menu item should be shown: true only
+    /// when plain New Workspace in the active window would route to a remote tmux
+    /// host. Reads `historyMenuCoordinator.state` so the menu re-evaluates on
+    /// window-focus and workspace-selection changes: the coordinator refreshes its
+    /// state when focus history changes and when a window becomes key, and a window
+    /// must become key before its menu bar opens. Also reads the controller's
+    /// mirror-membership, which changes when a mirror is added or removed. A workspace can
+    /// start or stop being a mirror while it stays selected, and neither focus nor
+    /// selection changes when that happens. The setting read keeps the menu in sync when
+    /// routing is toggled while the selected mirror remains unchanged.
+    private var newLocalWorkspaceMenuItemVisible: Bool {
+        let _ = historyMenuCoordinator.state
+        let _ = remoteTmuxNewWorkspaceOnHostEnabled
+        guard let appDelegate = AppDelegate.shared else { return false }
+        let _ = appDelegate.remoteTmuxController.mirrorMembership.workspaceIDs
+        return appDelegate.remoteTmuxController.wouldNewWorkspaceSpawnRemote(in: activeTabManager)
     }
 
     private func notificationMenuItemTitle(for notification: TerminalNotification) -> String {
@@ -1640,22 +1735,29 @@ private struct MainWindowBootstrapView: View {
                 window.identifier = NSUserInterfaceItemIdentifier("cmux.bootstrap")
                 window.isRestorable = false
                 window.orderOut(nil)
-                Task { @MainActor [weak window] in
-                    window?.orderOut(nil)
-                    window?.close()
+                let windowIdentifier = ObjectIdentifier(window)
+                Task { @MainActor in
+                    guard let window = NSApp.windows.first(where: { ObjectIdentifier($0) == windowIdentifier }) else {
+                        return
+                    }
+                    window.orderOut(nil)
+                    window.close()
                 }
             })
     }
 }
 private let cmuxAuxiliaryWindowIdentifiers: Set<String> = [
+    "cmux.newMachine",
     "cmux.settings",
     "cmux.about",
+    "cmux.cloud.welcome",
     "cmux.licenses",
     "cmux.browser-popup",
     "cmux.browserProfilePopoverDebug",
     "cmux.configEditor",
     "cmux.computerUse.onboarding",
     "cmux.defaultTerminalRegistrationError",
+    "cmux.featureFlags",
     "cmux.feedButtonStyleDebug",
     "cmux.feedPreview",
     "cmux.feedTextEditorDebug",
@@ -1683,6 +1785,7 @@ private let cmuxAuxiliaryWindowIdentifiers: Set<String> = [
     "cmux.mobilePairingWindow",
     "cmux.sidebarFooterIconBalanceDebug",
     "cmux.cloudPaneCreationFailure.card",
+    "cmux.cloudCreateTeam",
     "cmux.sudo.approval",
 ]
 
@@ -1799,6 +1902,7 @@ private final class DebugWindowControlsWindowController: ReleasingWindowControll
 }
 
 private struct DebugWindowControlsView: View {
+    @Environment(\.cmuxAccentColor) private var cmuxAccent
     @AppStorage(WorkspaceColorsCatalogSection().indicatorStyle.userDefaultsKey)
     private var sidebarActiveTabIndicatorStyle = WorkspaceColorsCatalogSection().indicatorStyle.defaultValue.rawValue
     @AppStorage(BrowserDevToolsButtonDebugSettings.iconNameKey) private var browserDevToolsIconNameRaw = BrowserDevToolsButtonDebugSettings.defaultIcon.rawValue
@@ -1988,7 +2092,7 @@ private struct DebugWindowControlsView: View {
                             Spacer()
                             Image(systemName: selectedDevToolsIconOption.rawValue)
                                 .cmuxFont(size: 12, weight: .medium)
-                                .foregroundStyle(selectedDevToolsColorOption.color)
+                                .foregroundStyle(selectedDevToolsColorOption.color(accent: cmuxAccent))
                         }
 
                         HStack(spacing: 12) {
@@ -2345,7 +2449,7 @@ private struct BrowserImportHintDebugView: View {
                             }
                             Button("Open Import Dialog") {
                                 DispatchQueue.main.async {
-                                    BrowserDataImportCoordinator.shared.presentImportDialog()
+                                    AppDelegate.shared?.browserDataImportCoordinator?.presentImportDialog()
                                 }
                             }
                         }
@@ -2424,77 +2528,6 @@ private struct BrowserImportHintDebugView: View {
             return "Hidden"
         case .settingsOnly:
             return "Settings Only"
-        }
-    }
-}
-
-private final class AboutWindowController: ReleasingWindowController {
-    static let shared = AboutWindowController()
-
-    override func makeWindow() -> NSWindow {
-        let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 360, height: 520),
-            styleMask: [.titled, .closable, .miniaturizable],
-            backing: .buffered,
-            defer: false
-        )
-        window.identifier = NSUserInterfaceItemIdentifier("cmux.about")
-        window.center()
-        window.contentView = NSHostingView(rootView: AboutPanelView())
-        AppDelegate.shared?.aboutTitlebarDebugStore.applyCurrentOptions(to: window, for: .about)
-        AppDelegate.shared?.applyWindowDecorations(to: window)
-        return window
-    }
-
-    func show() {
-        let window = managedWindow()
-        AppDelegate.shared?.aboutTitlebarDebugStore.applyCurrentOptions(to: window, for: .about)
-        window.center()
-        window.makeKeyAndOrderFront(nil)
-    }
-}
-
-private final class AcknowledgmentsWindowController: ReleasingWindowController {
-    static let shared = AcknowledgmentsWindowController()
-
-    private override init() {
-        super.init()
-    }
-
-    override func makeWindow() -> NSWindow {
-        let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 500, height: 480),
-            styleMask: [.titled, .closable, .miniaturizable, .resizable],
-            backing: .buffered,
-            defer: false
-        )
-        window.title = String(localized: "about.licenses", defaultValue: "Licenses")
-        window.identifier = NSUserInterfaceItemIdentifier("cmux.licenses")
-        window.center()
-        window.contentView = NSHostingView(rootView: AcknowledgmentsView())
-        return window
-    }
-
-    @available(*, unavailable)
-    required init?(coder: NSCoder) {
-        fatalError("init(coder:) has not been implemented")
-    }
-
-    func show() {
-        showManagedWindow(centerWhenHidden: false)
-    }
-}
-
-private struct AcknowledgmentsView: View {
-    private let content = AboutLicenseContent(bundle: .main).load()
-
-    var body: some View {
-        ScrollView {
-            Text(content)
-                .cmuxFont(.body, design: .monospaced)
-                .textSelection(.enabled)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding()
         }
     }
 }
@@ -3413,97 +3446,9 @@ private struct SidebarFooterHelpIconReference: View {
 }
 #endif
 
-private struct AboutPanelView: View {
-    @Environment(\.openURL) private var openURL
-
-    private let githubURL = URL(string: "https://github.com/manaflow-ai/cmux")
-    private let docsURL = URL(string: "https://cmux.com/docs")
-
-    private var version: String? { Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String }
-    private var build: String? { Bundle.main.infoDictionary?["CFBundleVersion"] as? String }
-    private var commit: String? {
-        if let value = Bundle.main.infoDictionary?["CMUXCommit"] as? String, !value.isEmpty {
-            return value
-        }
-        let env = ProcessInfo.processInfo.environment["CMUX_COMMIT"] ?? ""
-        return env.isEmpty ? nil : env
-    }
-    private var copyright: String? { Bundle.main.infoDictionary?["NSHumanReadableCopyright"] as? String }
-
-    var body: some View {
-        VStack(alignment: .center) {
-            Image(nsImage: NSApplication.shared.applicationIconImage)
-                .resizable()
-                .renderingMode(.original)
-                .frame(width: 96, height: 96)
-                .shadow(color: .black.opacity(0.18), radius: 8, x: 0, y: 3)
-
-            VStack(alignment: .center, spacing: 32) {
-                VStack(alignment: .center, spacing: 8) {
-                    Text(String(localized: "about.appName", defaultValue: "cmux"))
-                        .cmuxFont(.title)
-                        .bold()
-                    Text(String(localized: "about.description", defaultValue: "A Ghostty-based terminal with vertical tabs\nand a notification panel for macOS."))
-                        .multilineTextAlignment(.center)
-                        .fixedSize(horizontal: false, vertical: true)
-                        .cmuxFont(.caption)
-                        .tint(.secondary)
-                        .opacity(0.8)
-                }
-                .textSelection(.enabled)
-
-                VStack(spacing: 2) {
-                    if let version {
-                        AboutPropertyRow(label: String(localized: "about.version", defaultValue: "Version"), text: version)
-                    }
-                    if let build {
-                        AboutPropertyRow(label: String(localized: "about.build", defaultValue: "Build"), text: build)
-                    }
-                    let commitText = commit ?? "—"
-                    let commitURL = commit.flatMap { hash in
-                        URL(string: "https://github.com/manaflow-ai/cmux/commit/\(hash)")
-                    }
-                    AboutPropertyRow(label: String(localized: "about.commit", defaultValue: "Commit"), text: commitText, url: commitURL)
-                }
-                .frame(maxWidth: .infinity)
-
-                HStack(spacing: 8) {
-                    if let url = docsURL {
-                        Button(String(localized: "about.docs", defaultValue: "Docs")) {
-                            openURL(url)
-                        }
-                    }
-                    if let url = githubURL {
-                        Button(String(localized: "about.github", defaultValue: "GitHub")) {
-                            openURL(url)
-                        }
-                    }
-                    Button(String(localized: "about.licenses", defaultValue: "Licenses")) {
-                        AcknowledgmentsWindowController.shared.show()
-                    }
-                }
-
-                if let copy = copyright, !copy.isEmpty {
-                    Text(copy)
-                        .cmuxFont(.caption)
-                        .textSelection(.enabled)
-                        .tint(.secondary)
-                        .opacity(0.8)
-                        .multilineTextAlignment(.center)
-                        .frame(maxWidth: .infinity)
-                }
-            }
-            .frame(maxWidth: .infinity)
-        }
-        .padding(.top, 8)
-        .padding(32)
-        .frame(minWidth: 280)
-        .background(AboutVisualEffectBackground(material: .underWindowBackground).ignoresSafeArea())
-    }
-}
-
 private struct SidebarDebugView: View {
-    @AppStorage("sidebarMatchTerminalBackground") private var matchTerminalBackground = false
+    @Environment(\.cmuxAccentColor) private var cmuxAccent
+    @AppStorage("sidebarMatchTerminalBackground") private var matchTerminalBackground = SidebarAppearanceCatalogSection().matchTerminalBackground.defaultValue
     @AppStorage("sidebarPreset") private var sidebarPreset = SidebarPresetOption.nativeSidebar.rawValue
     @AppStorage("sidebarTintOpacity") private var sidebarTintOpacity = SidebarTintDefaults().opacity
     @AppStorage("sidebarTintHex") private var sidebarTintHex = SidebarTintDefaults().hex
@@ -3544,7 +3489,7 @@ private struct SidebarDebugView: View {
                 if let hex = sidebarSelectionColorHex, let nsColor = NSColor(hex: hex) {
                     return Color(nsColor: nsColor)
                 }
-                return cmuxAccentColor()
+                return cmuxAccent.color
             },
             set: { newColor in
                 let nsColor = NSColor(newColor)
@@ -5001,73 +4946,6 @@ private struct StartupAppearanceDebugView: View {
     }
 }
 
-private struct AboutPropertyRow: View {
-    private let label: String
-    private let text: String
-    private let url: URL?
-
-    init(label: String, text: String, url: URL? = nil) {
-        self.label = label
-        self.text = text
-        self.url = url
-    }
-
-    @ViewBuilder private var textView: some View {
-        Text(text)
-            .frame(width: 140, alignment: .leading)
-            .padding(.leading, 2)
-            .tint(.secondary)
-            .opacity(0.8)
-            .monospaced()
-    }
-
-    var body: some View {
-        HStack(spacing: 4) {
-            Text(label)
-                .frame(width: 126, alignment: .trailing)
-                .padding(.trailing, 2)
-            if let url {
-                Link(destination: url) {
-                    textView
-                }
-            } else {
-                textView
-            }
-        }
-        .cmuxFont(.callout)
-        .textSelection(.enabled)
-        .frame(maxWidth: .infinity)
-    }
-}
-
-private struct AboutVisualEffectBackground: NSViewRepresentable {
-    let material: NSVisualEffectView.Material
-    let blendingMode: NSVisualEffectView.BlendingMode
-    let isEmphasized: Bool
-
-    init(
-        material: NSVisualEffectView.Material,
-        blendingMode: NSVisualEffectView.BlendingMode = .behindWindow,
-        isEmphasized: Bool = false
-    ) {
-        self.material = material
-        self.blendingMode = blendingMode
-        self.isEmphasized = isEmphasized
-    }
-
-    func updateNSView(_ nsView: NSVisualEffectView, context: Context) {
-        nsView.material = material
-        nsView.blendingMode = blendingMode
-        nsView.isEmphasized = isEmphasized
-    }
-
-    func makeNSView(context: Context) -> NSVisualEffectView {
-        let visualEffect = NSVisualEffectView()
-        visualEffect.autoresizingMask = [.width, .height]
-        return visualEffect
-    }
-}
-
 enum AppIconMode: String, CaseIterable, Identifiable {
     case automatic
     case light
@@ -5314,58 +5192,6 @@ final class AppIconAppearanceObserver: NSObject {
               let icon = environment.imageForName(imageName) else { return }
         environment.setApplicationIconImage(icon)
         lastAppliedImageName = imageName
-    }
-}
-
-enum BuildFlavor: String, Sendable {
-    case dev
-    case nightly
-    case rc
-    case stable
-
-    static var current: BuildFlavor {
-        let bundle = Bundle.main
-        return detect(
-            bundleNames: [
-                bundle.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String,
-                bundle.object(forInfoDictionaryKey: "CFBundleName") as? String,
-                ProcessInfo.processInfo.processName,
-            ].compactMap { $0 },
-            bundleIdentifier: bundle.bundleIdentifier
-        )
-    }
-
-    static func detect(bundleName: String?, bundleIdentifier: String?) -> BuildFlavor {
-        detect(bundleNames: [bundleName].compactMap { $0 }, bundleIdentifier: bundleIdentifier)
-    }
-
-    static func detect(bundleNames: [String], bundleIdentifier: String?) -> BuildFlavor {
-        if bundleNames.contains(where: containsDevToken) {
-            return .dev
-        }
-
-        let normalizedBundleIdentifier = bundleIdentifier?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased()
-
-        if SocketControlSettings.isDebugLikeBundleIdentifier(normalizedBundleIdentifier) {
-            return .dev
-        }
-        if let channel = releaseChannel(normalizedBundleIdentifier: normalizedBundleIdentifier, bundleNames: bundleNames) {
-            return channel
-        }
-        return .stable
-    }
-
-    private static func containsDevToken(_ name: String) -> Bool {
-        containsToken("DEV", in: name)
-    }
-
-    static func containsToken(_ token: String, in name: String) -> Bool {
-        name
-            .uppercased()
-            .split { !$0.isLetter && !$0.isNumber }
-            .contains { String($0) == token }
     }
 }
 

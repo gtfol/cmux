@@ -1,6 +1,6 @@
 {
   "$schema": "./node_modules/wrangler/config-schema.json",
-  "name": "cmux-iroh-v2-local",
+  "name": "cmux-v2-local",
   "main": "src/index.ts",
   "compatibility_date": "2026-09-10",
   "compatibility_flags": [
@@ -24,6 +24,10 @@
       {
         "name": "USER_USAGE",
         "class_name": "UserUsage"
+      },
+      {
+        "name": "ACCOUNT_CONTROL",
+        "class_name": "AccountControl"
       }
     ]
   },
@@ -49,6 +53,12 @@
         "TeamControl",
         "UserUsage"
       ]
+    },
+    {
+      "tag": "iroh-v2-account-control-1",
+      "new_sqlite_classes": [
+        "AccountControl"
+      ]
     }
   ],
   "observability": {
@@ -62,7 +72,7 @@
   },
   "env": {
     "development": {
-      "name": "cmux-iroh-v2-development",
+      "name": "cmux-v2-development",
       "vars": {
         "ENVIRONMENT": "development",
         "STACK_API_URL": "https://api.stack-auth.com",
@@ -79,6 +89,10 @@
           {
             "name": "USER_USAGE",
             "class_name": "UserUsage"
+          },
+          {
+            "name": "ACCOUNT_CONTROL",
+            "class_name": "AccountControl"
           }
         ]
       },
@@ -99,7 +113,7 @@
       }
     },
     "staging": {
-      "name": "cmux-iroh-v2-staging",
+      "name": "cmux-v2-staging",
       "vars": {
         "ENVIRONMENT": "staging",
         "STACK_API_URL": "https://api.stack-auth.com",
@@ -116,6 +130,10 @@
           {
             "name": "USER_USAGE",
             "class_name": "UserUsage"
+          },
+          {
+            "name": "ACCOUNT_CONTROL",
+            "class_name": "AccountControl"
           }
         ]
       },
@@ -136,7 +154,7 @@
       }
     },
     "production": {
-      "name": "cmux-iroh-v2",
+      "name": "cmux-v2",
       "vars": {
         "ENVIRONMENT": "production",
         "STACK_API_URL": "https://api.stack-auth.com",
@@ -153,6 +171,10 @@
           {
             "name": "USER_USAGE",
             "class_name": "UserUsage"
+          },
+          {
+            "name": "ACCOUNT_CONTROL",
+            "class_name": "AccountControl"
           }
         ]
       },

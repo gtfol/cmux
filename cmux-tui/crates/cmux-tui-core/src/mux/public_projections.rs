@@ -15,6 +15,8 @@ pub(super) struct RestoredPublicProjections {
     pub(super) notification_reads: HashMap<NotificationPublicId, BTreeSet<String>>,
 }
 
+/// Rebuild the in-memory notification ledger, agent records (with their
+/// published hook session ids), and hook fences from durable projections.
 pub(super) fn restore_public_projections(
     state: &State,
     projections: RegistryPublicProjections,
@@ -35,17 +37,16 @@ pub(super) fn restore_public_projections(
                 .or_else(|| state.terminal_catalog.get(terminal_id).map(|surface| surface.id))
         });
         let level = notification_level(&notification.level)?;
-        if notification.unread {
-            let terminal_id = notification
-                .terminal_id
-                .clone()
-                .context("terminal notification omitted its terminal identity")?;
-            if surface.is_some() {
-                terminal_notifications.insert(
-                    terminal_id,
-                    SurfaceNotification { notification: numeric_id, level, unread: true },
-                );
-            }
+        // Durable notifications can outlive their terminal. Keep their
+        // history, but only restore an unread marker while its terminal exists.
+        if notification.unread
+            && surface.is_some()
+            && let Some(terminal_id) = notification.terminal_id.clone()
+        {
+            terminal_notifications.insert(
+                terminal_id,
+                SurfaceNotification { notification: numeric_id, level, unread: true },
+            );
         }
         if !notification.read_by.is_empty() {
             notification_reads.insert(
@@ -120,6 +121,7 @@ pub(super) fn restore_public_projections(
                 source: agent_source(&agent.source)?,
                 session: (!internal_marker).then_some(agent.source_session).flatten(),
                 agent: agent.agent,
+                agent_session_id: agent.agent_session_id,
                 updated_at_ms: agent.updated_at_ms,
             },
         );
@@ -240,6 +242,7 @@ mod tests {
                 updated_at_ms: 1,
                 source_session: None,
                 agent: None,
+                agent_session_id: None,
             }],
             agent_hook_states: Vec::new(),
             terminal_defaults: None,
@@ -258,7 +261,7 @@ mod tests {
     }
 
     #[test]
-    fn unread_projection_without_terminal_identity_is_rejected() {
+    fn unread_projection_without_terminal_identity_restores_history_without_badge() {
         let projections = RegistryPublicProjections {
             notifications: vec![RegistryNotificationProjection {
                 id: NotificationPublicId::parse("notification_00000000000000000000000000000002")
@@ -278,8 +281,10 @@ mod tests {
             frontend_projections: Vec::new(),
         };
 
-        let error = restore_public_projections(&empty_state(), projections).unwrap_err();
-        assert!(error.to_string().contains("omitted its terminal identity"));
+        let restored = restore_public_projections(&empty_state(), projections).unwrap();
+        assert_eq!(restored.notification_ledger.len(), 1);
+        assert_eq!(restored.notification_ledger[0].terminal_id, None);
+        assert!(restored.terminal_notifications.is_empty());
     }
 
     #[test]
@@ -323,6 +328,7 @@ mod tests {
                 updated_at_ms: 1,
                 source_session: None,
                 agent: None,
+                agent_session_id: None,
             }],
             agent_hook_states: Vec::new(),
             terminal_defaults: None,
@@ -346,6 +352,7 @@ mod tests {
                 updated_at_ms: 1,
                 source_session: Some("cmux-hook-sequence:12".into()),
                 agent: None,
+                agent_session_id: None,
             }],
             agent_hook_states: Vec::new(),
             terminal_defaults: None,
@@ -369,6 +376,7 @@ mod tests {
                 updated_at_ms: 3,
                 source_session: Some("socket-session".into()),
                 agent: None,
+                agent_session_id: None,
             }],
             agent_hook_states: Vec::new(),
             terminal_defaults: None,

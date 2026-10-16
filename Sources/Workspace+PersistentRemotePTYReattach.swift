@@ -64,11 +64,6 @@ extension Workspace {
             let usesPersistentSSHPTY = configuration.transport == .ssh &&
                 !configuration.skipDaemonBootstrap && configuration.persistentDaemonSlot != nil
             if usesPersistentSSHPTY {
-                let approvedResumeCommand = approvedPersistentSSHResumeCommand(
-                    for: resumeBinding,
-                    panelID: panelId,
-                    persistentPTYSessionID: sessionID
-                )
                 let restartedShellCommand = sessionEnded
                     ? configuration.relayPort.map {
                         SSHPTYAttachStartupCommandBuilder.restoredRemoteShellCommand(
@@ -79,7 +74,11 @@ extension Workspace {
                     : nil
                 command = remotePTYAttachStartupCommand(
                     sessionID: sessionID,
-                    remoteCommand: approvedResumeCommand ?? restartedShellCommand,
+                    // Carry the approved workspace command through the attach wrapper.
+                    // Existing sessions ignore it; a missing-session fallback reuses it.
+                    remoteCommand: sessionEnded
+                        ? restartedShellCommand
+                        : configuration.configuredRemoteCommand,
                     requireExisting: !sessionEnded
                 )
             } else {

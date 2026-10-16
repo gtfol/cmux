@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 
+import contextlib
 import importlib.util
+import io
 import json
 from pathlib import Path
 import tempfile
@@ -156,6 +158,55 @@ def test_known_failure_is_tolerated_but_new_failure_blocks() -> None:
     assert "RATCHET_NEW_FAILURE FooTests/testBad()" in messages
 
 
+def test_changed_suites_run_rejects_a_passing_known_failure() -> None:
+    inventory = {"FooTests/testFixed()", "BarTests/testGood()"}
+    selectors = ["FooTests", "BarTests"]
+    results = {
+        "FooTests/testFixed()": "Passed",
+        "BarTests/testGood()": "Passed",
+    }
+    known = {"FooTests/testFixed()": {"classification": "test bug"}}
+
+    # A main shard only reports it: a flaky entry may pass on any one run.
+    passed, messages = accounting.check_run(
+        inventory=inventory,
+        selectors=selectors,
+        results=results,
+        known=known,
+        log_text="** TEST SUCCEEDED **\n",
+        xcode_status=0,
+    )
+    assert passed is True
+    assert "RATCHET_KNOWN_NOW_PASSING FooTests/testFixed()" in messages
+
+    # A PR that edited the suite must drop the entry, or its green run proves
+    # nothing about the fix.
+    passed, messages = accounting.check_run(
+        inventory=inventory,
+        selectors=selectors,
+        results=results,
+        known=known,
+        log_text="** TEST SUCCEEDED **\n",
+        xcode_status=0,
+        changed_suites=True,
+    )
+    assert passed is False
+    assert "RATCHET_KNOWN_NOW_PASSING FooTests/testFixed()" in messages
+    assert any("app-host-known-failures.json" in line for line in messages)
+
+    # Once the entry is gone, the same run passes.
+    passed, _ = accounting.check_run(
+        inventory=inventory,
+        selectors=selectors,
+        results=results,
+        known={},
+        log_text="** TEST SUCCEEDED **\n",
+        xcode_status=0,
+        changed_suites=True,
+    )
+    assert passed is True
+
+
 def test_zero_matching_selector_never_passes() -> None:
     passed, messages = accounting.check_run(
         inventory={"FooTests/testOne()"},
@@ -167,6 +218,32 @@ def test_zero_matching_selector_never_passes() -> None:
     )
     assert passed is False
     assert messages == ["selector matched zero built tests: MissingSuite"]
+
+
+def test_empty_selector_list_never_passes() -> None:
+    passed, messages = accounting.check_run(
+        inventory={"FooTests/testOne()"},
+        selectors=[],
+        results={"FooTests/testOne()": "Passed"},
+        known={},
+        log_text="** TEST SUCCEEDED **\n",
+        xcode_status=0,
+    )
+    assert passed is False
+    assert messages == ["no selectors: nothing was selected to run"]
+
+
+def test_empty_inventory_never_passes() -> None:
+    passed, messages = accounting.check_run(
+        inventory=set(),
+        selectors=["FooTests"],
+        results={"FooTests/testOne()": "Passed"},
+        known={},
+        log_text="** TEST SUCCEEDED **\n",
+        xcode_status=0,
+    )
+    assert passed is False
+    assert messages == ["inventory lists no built tests"]
 
 
 def test_missing_selected_test_result_never_passes() -> None:
@@ -267,6 +344,36 @@ def test_unknown_or_nonterminal_typed_result_never_passes() -> None:
         ]
 
 
+def test_duplicate_nonterminal_result_is_not_hidden_by_a_pass() -> None:
+    identifier = "FooTests/testOne()"
+    for nonterminal in ("Running", ""):
+        for order in (("Passed", nonterminal), (nonterminal, "Passed")):
+            nodes = [
+                {"nodeType": "Test Case", "nodeIdentifier": identifier, "result": result}
+                for result in order
+            ]
+            within_file = accounting.parse_xcresult_tests({"testNodes": nodes})
+            with tempfile.TemporaryDirectory() as directory:
+                paths = [Path(directory) / f"{index}.json" for index in range(2)]
+                for path, node in zip(paths, nodes):
+                    path.write_text(json.dumps({"testNodes": [node]}), encoding="utf-8")
+                across_files = accounting.merge_result_files(paths)
+
+            for results in (within_file, across_files):
+                passed, messages = accounting.check_run(
+                    inventory={identifier},
+                    selectors=["FooTests"],
+                    results=results,
+                    known={},
+                    log_text="** TEST SUCCEEDED **\n",
+                    xcode_status=0,
+                )
+                assert passed is False, (order, results, messages)
+                assert messages == [
+                    f"typed Test Case has nonterminal or unknown result: {identifier} ({nonterminal})"
+                ]
+
+
 def test_restart_or_outer_timeout_is_never_ratcheted_green() -> None:
     for log in (
         "Restarting after unexpected exit, crash, or test timeout\n** TEST FAILED **\n",
@@ -345,6 +452,53 @@ def test_catalog_may_only_shrink() -> None:
             assert status == expected
 
 
+def _catalog_diff(base: dict[str, object], current: dict[str, object]) -> int:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        base_path = root / "base.json"
+        current_path = root / "current.json"
+        base_path.write_text(json.dumps(base), encoding="utf-8")
+        current_path.write_text(json.dumps(current), encoding="utf-8")
+        return accounting.command_catalog_diff(
+            SimpleNamespace(base=base_path, current=current_path)
+        )
+
+
+def test_empty_catalog_bootstraps_once_from_a_pinned_main_census() -> None:
+    """The catalog's own comment promises a bootstrap; the diff used to forbid it.
+
+    Every addition was rejected, including the first, so the ratchet could
+    never tolerate anything and every app-host PR inherited main's whole red
+    set.
+    """
+    empty = {"bootstrap_main_sha": None, "version": 1, "tests": {}}
+    census = _catalog({
+        "FooTests/testOne()": {"classification": "product bug", "issue": 1},
+        "BarTests/testTwo()": {"classification": "unknown"},
+    })
+    assert _catalog_diff(empty, census) == 0
+
+    # Once pinned, growth is closed again, even by re-stating the same SHA.
+    grown = json.loads(json.dumps(census))
+    grown["tests"]["BazTests/testThree()"] = {"classification": "unknown"}
+    assert _catalog_diff(census, grown) == 1
+
+
+def test_bootstrap_still_requires_a_pinned_sha() -> None:
+    empty = {"bootstrap_main_sha": None, "version": 1, "tests": {}}
+    unpinned = {
+        "bootstrap_main_sha": None,
+        "version": 1,
+        "tests": {"FooTests/testOne()": {"classification": "unknown"}},
+    }
+    try:
+        _catalog_diff(empty, unpinned)
+    except ValueError as error:
+        assert "bootstrap_main_sha" in str(error)
+    else:
+        raise AssertionError("an unpinned catalog was bootstrapped")
+
+
 def test_catalog_diff_rejects_changed_bootstrap_sha_even_when_tests_match() -> None:
     base = {
         "bootstrap_main_sha": "1" * 40,
@@ -409,6 +563,99 @@ def test_catalog_requires_campaign_classification() -> None:
         assert "invalid classification" in str(error)
     else:
         raise AssertionError("invalid classification was accepted")
+
+
+def test_inventory_refuses_hung_or_empty_enumeration() -> None:
+    # What xcodebuild -enumerate-tests wrote (exit 0) when the runner hung on cmux9s.
+    hung = {
+        "errors": [
+            "cmux DEV (65703) encountered an error. (Underlying Error: The test runner hung before establishing connection.)"
+        ],
+        "values": [{"children": [{"kind": "target", "name": "cmuxTests"}], "kind": "plan", "name": "cmux-unit"}],
+    }
+    with tempfile.TemporaryDirectory() as tmp:
+        for payload, expected in ((hung, "hung before establishing connection"), ({"values": []}, "found no tests")):
+            source = Path(tmp) / "enumeration.json"
+            output = Path(tmp) / "inventory.json"
+            source.write_text(json.dumps(payload), encoding="utf-8")
+            assert accounting.main(["inventory", str(source), "--output", str(output)]) == 2
+            assert not output.exists()
+            try:
+                accounting.write_inventory(source, output)
+            except ValueError as error:
+                assert expected in str(error), error
+            else:
+                raise AssertionError(f"inventory accepted {payload}")
+
+
+def test_unreadable_json_input_names_the_file() -> None:
+    """An empty typed result must not be reported as a bare decoder message.
+
+    PR #15409's shard 8 aborted on the app-host restart budget, and the last
+    line the step printed before `exit 123` was
+    "Expecting value: line 1 column 1 (char 0)": no file, no subcommand, no
+    hint that the batch had been killed before xcodebuild wrote its result.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        inventory = root / "inventory.json"
+        inventory.write_text(json.dumps({"tests": ["FooTests/testOne()"]}), encoding="utf-8")
+        selectors = root / "selectors.txt"
+        selectors.write_text("FooTests\n", encoding="utf-8")
+        known = root / "known.json"
+        known.write_text(json.dumps({"version": 1, "tests": {}}), encoding="utf-8")
+        log = root / "batch.log"
+        log.write_text("** TEST SUCCEEDED **\n", encoding="utf-8")
+
+        # Ends on the first byte of a two-byte character, as a killed write does.
+        cut_mid_character = b'{"values": [{"identifier": "FooTests/testCaf' + "\u00e9".encode("utf-8")[:1]
+        for name, payload in (
+            ("empty.tests.json", b""),
+            ("truncated.tests.json", b'{"values": ['),
+            # The same aborted write, cut one byte into a multi-byte character.
+            # That fails as a decode error before the JSON parser sees anything,
+            # which is a second unnamed path to the same bare last line.
+            ("cut-mid-character.tests.json", cut_mid_character),
+        ):
+            tests_json = root / name
+            tests_json.write_bytes(payload)
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                status = accounting.main(
+                    [
+                        "check-run",
+                        "--inventory",
+                        str(inventory),
+                        "--selectors",
+                        str(selectors),
+                        "--known",
+                        str(known),
+                        "--log",
+                        str(log),
+                        "--xcode-status",
+                        "0",
+                        "--tests-json",
+                        str(tests_json),
+                    ]
+                )
+            assert status == 2
+            reported = stderr.getvalue()
+            assert name in reported, reported
+            assert (
+                "empty file" in reported
+                or "not valid JSON" in reported
+                or "not valid UTF-8" in reported
+            ), reported
+
+        # Selectors are read the same way and name themselves the same way.
+        bad_selectors = root / "bad-selectors.txt"
+        bad_selectors.write_bytes(b"FooTests/testCaf\xe9()\n")
+        try:
+            accounting.load_selectors(bad_selectors)
+        except ValueError as error:
+            assert "bad-selectors.txt" in str(error), str(error)
+        else:
+            raise AssertionError("expected load_selectors to reject non-UTF-8 bytes")
 
 
 if __name__ == "__main__":

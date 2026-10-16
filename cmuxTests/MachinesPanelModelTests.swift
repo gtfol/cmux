@@ -1,3 +1,5 @@
+import CmuxCloud
+import CmuxSurfaceCatalogModel
 import Foundation
 import Bonsplit
 import Testing
@@ -9,6 +11,29 @@ import XCTest
 @testable import cmux
 #endif
 final class MachinesPanelModelTests: XCTestCase {
+    @MainActor
+    func testLocalWorkspaceProjectionRefreshesWithoutCatalogPoll() {
+        let first = UUID()
+        let second = UUID()
+        var selected = first
+        let model = MachinesPanelViewModel(
+            client: nil,
+            isCloudEnabled: { false },
+            localWorkspacesProvider: {
+                [
+                    CloudTreeLocalWorkspace(id: first, title: "first", isSelected: selected == first),
+                    CloudTreeLocalWorkspace(id: second, title: "second", isSelected: selected == second),
+                ]
+            }
+        )
+
+        model.refreshLocalWorkspaces(selectedWorkspaceID: selected)
+        XCTAssertEqual(model.localWorkspaces.first(where: \.isSelected)?.id, first)
+        selected = second
+        model.refreshLocalWorkspaces(selectedWorkspaceID: selected)
+        XCTAssertEqual(model.localWorkspaces.first(where: \.isSelected)?.id, second)
+    }
+
     func testSnapshotMapsSummaryFields() {
         let summary = VMSummary(
             id: "noble-wren",
@@ -160,18 +185,18 @@ final class MachinesPanelModelTests: XCTestCase {
 
         // Availability follows the Cloud VM UI flag, independent of feed/dock.
         XCTAssertTrue(
-            RightSidebarMode.machines.isAvailable(feedEnabled: false, dockEnabled: false, machinesEnabled: true)
+            RightSidebarMode.machines.isAvailable(feedEnabled: false, machinesEnabled: true)
         )
         XCTAssertFalse(
-            RightSidebarMode.machines.isAvailable(feedEnabled: true, dockEnabled: true, machinesEnabled: false)
+            RightSidebarMode.machines.isAvailable(feedEnabled: true, machinesEnabled: false)
         )
         XCTAssertEqual(
-            RightSidebarMode.availableModes(feedEnabled: false, dockEnabled: false, machinesEnabled: true),
-            [.files, .find, .sessions, .machines]
+            RightSidebarMode.availableModes(feedEnabled: false, machinesEnabled: true),
+            [.files, .find, .sessions, .dock, .machines]
         )
         XCTAssertEqual(
-            RightSidebarMode.availableModes(feedEnabled: false, dockEnabled: false, machinesEnabled: false),
-            [.files, .find, .sessions]
+            RightSidebarMode.availableModes(feedEnabled: false, machinesEnabled: false),
+            [.files, .find, .sessions, .dock]
         )
     }
 
@@ -340,7 +365,7 @@ final class MachinesPanelModelTests: XCTestCase {
             now: now
         )
         XCTAssertEqual(single?.isSingleMachinePlan, true)
-        XCTAssertEqual(single?.countLabel, "1 of 1 machine")
+        XCTAssertEqual(single?.usage.countLabel, "1 of 1 machine")
         XCTAssertEqual(single?.freeAccessExpiresAt, serverExpiry)
         XCTAssertEqual(single?.freeAccessBanner, .expiresIn(countdown: "2d 1h"))
 
@@ -350,7 +375,7 @@ final class MachinesPanelModelTests: XCTestCase {
             now: now
         )
         XCTAssertEqual(plural?.isSingleMachinePlan, false)
-        XCTAssertEqual(plural?.countLabel, "2 of 5 machines")
+        XCTAssertEqual(plural?.usage.countLabel, "2 of 5 machines")
         XCTAssertEqual(plural?.freeAccessBanner, MachinePlanSnapshot.FreeAccessBanner.none)
     }
 
@@ -468,6 +493,9 @@ final class MachinesPanelModelTests: XCTestCase {
             "resource:vivid-newt/terminal/term_1",
             "resource:vivid-newt/terminal/term_2",
             "machine:vivid-newt/resources", "machine:vivid-newt/resources/cpu", "machine:vivid-newt/resources/memory", "machine:vivid-newt/resources/disk", "machine:vivid-newt/resources/usage",
+            // The Coderouter section always closes the tree (#17233), with one
+            // group per addable provider even before an account exists.
+            "coderouter-section", "coderouter-section/codex", "coderouter-section/claude", "coderouter-section/opencode-go",
         ])
         // A remote workspace already showing locally: its row marks it open and the click
         // jumps to that local workspace instead of opening a second copy.
@@ -577,11 +605,14 @@ final class MachinesPanelModelTests: XCTestCase {
         XCTAssertTrue(flattened[0].isMachineRow)
         XCTAssertTrue(flattened[3].isMachineRow)
         XCTAssertEqual(flattened[3].machine, .cloud("vivid-newt"))
-        // Only terminals and displays leave the tree by drag; workspaces,
-        // browsers, ports, machines, and headers do not.
+        // Remote workspace rows export their placement group alongside terminal
+        // and display leaves. Local workspace groups remain reorder-only because
+        // they point at live panes in the source workspace.
         for node in flattened {
             switch node.kind {
             case .terminal, .display:
+                XCTAssertTrue(node.isDragSource, "\(node.id) should drag")
+            case .workspace where !node.machine.isLocal:
                 XCTAssertTrue(node.isDragSource, "\(node.id) should drag")
             default:
                 XCTAssertFalse(node.isDragSource, "\(node.id) should not drag")
@@ -794,7 +825,10 @@ final class MachinesPanelModelTests: XCTestCase {
         )
         let nodes = CloudTreeNodeBuilder.nodes(machines: [], snapshot: snapshot, localWorkspaces: [CloudTreeLocalWorkspace(id: local, title: "web", isSelected: false)], includeLocalMachine: true)
         let ids = CloudTreeNodeBuilder.flattened(nodes).map(\.id)
-        XCTAssertEqual(ids, ["machine:local", "machine:local/placeholder", "machine:local/browsers", "resource:local/browser/BBB"])
+        XCTAssertEqual(ids, [
+            "machine:local", "machine:local/placeholder", "machine:local/browsers", "resource:local/browser/BBB",
+            "coderouter-section", "coderouter-section/codex", "coderouter-section/claude", "coderouter-section/opencode-go",
+        ])
         if case .browser(let row) = CloudTreeNodeBuilder.flattened(nodes)[3].kind {
             XCTAssertTrue(row.isOpen)
             XCTAssertEqual(row.workspaceTitle, "web")
@@ -985,15 +1019,39 @@ final class MachinesPanelModelTests: XCTestCase {
 @MainActor
 final class CloudTreeScopeAndSignatureTests: XCTestCase {
     func testMachineCapabilitiesDecodeWithSupportedDefaults() {
-        XCTAssertEqual(VMCapabilities(json: nil), .all, "an older control plane supports everything")
+        var legacy = VMCapabilities.all
+        legacy.restart = false
+        XCTAssertEqual(VMCapabilities(json: nil), legacy, "restart requires explicit server support")
+        XCTAssertTrue(VMCapabilities(json: ["restart": true]).restart)
+        XCTAssertFalse(VMCapabilities(json: ["restart": false]).restart)
         XCTAssertEqual(VMCapabilities(json: ["snapshot": false, "fork": false]), VMCapabilities(snapshot: false, restore: true, fork: false))
         XCTAssertEqual(VMCapabilities(json: ["snapshot": NSNumber(value: false), "restore": NSNumber(value: true), "fork": true]),
                        VMCapabilities(snapshot: false, restore: true, fork: true))
         let summary = VMSummary(id: "m", provider: "freestyle", status: "running", image: "cmux-devbox:devbox-20260828b", createdAt: 0, base: nil)
-        XCTAssertEqual(summary.capabilities, .all)
+        XCTAssertEqual(summary.capabilities, legacy)
         var declared = summary
         declared.capabilities = VMCapabilities(json: ["snapshot": false, "restore": false, "fork": false])
         XCTAssertFalse(declared.capabilities.snapshot)
+    }
+
+    func testSocketCloudVMSummaryPreservesAttachTransports() {
+        let summary = VMSummary(
+            id: "transport-limited",
+            provider: "freestyle",
+            status: "running",
+            image: "cmux-devbox",
+            createdAt: 0,
+            capabilities: VMCapabilities(
+                snapshot: true,
+                restore: true,
+                fork: true,
+                attachTransports: ["ssh"]
+            )
+        )
+
+        let payload = TerminalController.socketWorkerVMSummaryPayload(summary)
+        let capabilities = payload["capabilities"] as? [String: Any]
+        XCTAssertEqual(capabilities?["attach_transports"] as? [String], ["ssh"])
     }
 
     private func terminal(_ machine: SurfaceMachineID, _ key: String, title: String = "shell", cwd: String? = "/root") -> SurfaceResource {
@@ -1077,7 +1135,7 @@ final class CloudTreeScopeAndSignatureTests: XCTestCase {
     @Test func emptyDecisionMatchesWhatTheTreeRenders() {
         let localOnly = SurfaceCatalogSnapshot(machines: [info(.local)], resources: [terminal(.local, "AAA")], projections: [])
         #expect(
-            CloudTreeNodeBuilder.nodes(machines: [], snapshot: localOnly, localWorkspaces: []).isEmpty,
+            CloudTreeNodeBuilder.nodes(machines: [], snapshot: localOnly, localWorkspaces: []).withoutCoderouterSection.isEmpty,
             "precondition: the cloud-only tree renders nothing for a local-only catalog"
         )
         #expect(
@@ -1340,5 +1398,164 @@ struct MachineUsageReadoutTests {
         #expect(fact?.contains(line) == true, "compact usage follows the name on the same line")
         #expect(CloudTreeMachineRowContent(machine: withUsage).toolTip.contains(line), "spend stays available on hover")
     }
+}
 
+// MARK: - Realtime `vms` stream
+
+@MainActor
+final class MachinesPanelVMStreamTests: XCTestCase {
+
+    /// A panel with no client, no pin store and Cloud enabled: the stream's
+    /// merge path with nothing to fetch.
+    private func makeStreamingModel(pollingClock: any Clock<Duration> = ContinuousClock()) -> MachinesPanelViewModel {
+        let model = MachinesPanelViewModel(
+            createCoordinator: MachineCreateCoordinator(notifier: { _ in }, notificationCenter: NotificationCenter()),
+            pollingClock: pollingClock,
+            isCloudEnabled: { true },
+            catalogProvider: { .empty }
+        )
+        model.localWorkspacesProvider = { [] }
+        return model
+    }
+
+    /// Stats-less so a merge never samples the shared client.
+    private func streamSummary(_ id: String, status: String = "running", createdAt: Int64, label: String? = nil) -> VMSummary {
+        VMSummary(
+            id: id, provider: "freestyle", status: status, image: "cmux-devbox:devbox-20260828b", createdAt: createdAt,
+            capabilities: VMCapabilities(snapshot: true, restore: true, fork: true, stats: false), displayName: label
+        )
+    }
+
+    func testStreamUpsertReplacesTheRowInPlace() {
+        let model = makeStreamingModel()
+        model.applyVMChanges(
+            upserts: [streamSummary("c", createdAt: 3_000), streamSummary("b", createdAt: 2_000), streamSummary("a", createdAt: 1_000)],
+            deletions: [], authoritative: true
+        )
+        XCTAssertEqual(model.machines.map(\.id), ["c", "b", "a"])
+        XCTAssertTrue(model.hasLoadedOnce, "a complete fleet is a loaded list")
+
+        model.applyVMChanges(upserts: [streamSummary("b", status: "paused", createdAt: 2_000, label: "dev box")], deletions: [], authoritative: false)
+        XCTAssertEqual(model.machines.map(\.id), ["c", "b", "a"], "an update keeps the row's slot")
+        XCTAssertEqual(model.machines[1].activity, .ready)
+        XCTAssertEqual(model.machines[1].label, "dev box")
+        XCTAssertEqual(model.machineIndexByID, ["c": 0, "b": 1, "a": 2])
+    }
+
+    func testStreamInsertKeepsCreatedAtDescendingOrder() {
+        let model = makeStreamingModel()
+        model.applyVMChanges(
+            upserts: [streamSummary("c", createdAt: 3_000), streamSummary("a", createdAt: 1_000)],
+            deletions: [], authoritative: true
+        )
+        model.applyVMChanges(upserts: [streamSummary("b", createdAt: 2_000)], deletions: [], authoritative: false)
+        XCTAssertEqual(model.machines.map(\.id), ["c", "b", "a"])
+        model.applyVMChanges(upserts: [streamSummary("d", createdAt: 4_000)], deletions: [], authoritative: false)
+        XCTAssertEqual(model.machines.map(\.id), ["d", "c", "b", "a"], "the newest machine leads, as the list endpoint orders it")
+        model.applyVMChanges(upserts: [streamSummary("z", createdAt: 0)], deletions: [], authoritative: false)
+        XCTAssertEqual(model.machines.map(\.id), ["d", "c", "b", "a", "z"], "an unknown creation time sorts last")
+        XCTAssertEqual(model.machineIndexByID, ["d": 0, "c": 1, "b": 2, "a": 3, "z": 4])
+        XCTAssertNil(model.plan, "limits only arrive with a REST list")
+    }
+
+    func testStreamDeleteRemovesTheRow() {
+        let model = makeStreamingModel()
+        model.applyVMChanges(
+            upserts: [streamSummary("c", createdAt: 3_000), streamSummary("b", createdAt: 2_000), streamSummary("a", createdAt: 1_000)],
+            deletions: [], authoritative: true
+        )
+        model.applyVMChanges(upserts: [], deletions: ["b", "never-listed"], authoritative: false)
+        XCTAssertEqual(model.machines.map(\.id), ["c", "a"])
+        XCTAssertEqual(model.machineIndexByID, ["c": 0, "a": 1])
+
+        // A backfilled snapshot is the complete fleet: rows it lacks are gone.
+        model.applyVMChanges(upserts: [streamSummary("a", createdAt: 1_000)], deletions: [], authoritative: true)
+        XCTAssertEqual(model.machines.map(\.id), ["a"])
+    }
+
+    func testUnbackfilledSnapshotNeverDeletes() {
+        let model = makeStreamingModel()
+        model.applyVMChanges(
+            upserts: [streamSummary("c", createdAt: 3_000), streamSummary("a", createdAt: 1_000)],
+            deletions: [], authoritative: true
+        )
+        // The worker has only seen `b` since the collection shipped: it may
+        // add and update, but `c` and `a` stay until a REST list says otherwise.
+        model.applyVMChanges(upserts: [streamSummary("b", createdAt: 2_000)], deletions: [], authoritative: false)
+        XCTAssertEqual(model.machines.map(\.id), ["c", "b", "a"])
+        model.applyVMChanges(upserts: [], deletions: [], authoritative: false)
+        XCTAssertEqual(model.machines.map(\.id), ["c", "b", "a"])
+    }
+
+    /// The stream record carries only the row's own columns; per-request
+    /// list fields (creator name, pool claim, free-access expiry) must survive
+    /// a live update instead of resetting until the next REST read.
+    func testStreamUpsertKeepsListOnlyFieldsOfTheExistingRow() {
+        let model = makeStreamingModel()
+        var listed = streamSummary("a", createdAt: 1_000)
+        listed.createdBy = VMCreator(userId: "user-1", displayName: "Ada")
+        let claim = CloudVMResourceReservation(vcpus: 4, memoryMb: 8_192)
+        listed.resourcePoolClaim = claim
+        listed.resourceReservation = claim
+        listed.agentUpdates = .latest
+        let expiresAt = Int64(Date().addingTimeInterval(3 * 86_400).timeIntervalSince1970 * 1000)
+        listed.freeAccessExpiresAt = expiresAt
+        model.applyVMChanges(upserts: [listed], deletions: [], authoritative: true)
+        let before = model.machines[0]
+
+        var streamed = streamSummary("a", status: "paused", createdAt: 1_000, label: "renamed")
+        streamed.createdBy = VMCreator(userId: "user-1")
+        model.applyVMChanges(upserts: [streamed], deletions: [], authoritative: false)
+
+        let after = model.machines[0]
+        XCTAssertEqual(after.label, "renamed", "the stream's own columns apply")
+        XCTAssertEqual(after.createdBy, VMCreator(userId: "user-1", displayName: "Ada"))
+        XCTAssertEqual(after.resourcePoolClaim, claim)
+        XCTAssertEqual(after.resourceReservation, claim)
+        XCTAssertEqual(after.agentUpdates, .latest)
+        XCTAssertEqual(after.freeAccess, before.freeAccess)
+    }
+
+    func testStreamInsertTakesTheCreatorFromTheRecord() throws {
+        let summary = try VMClient.decodeListItem([
+            "id": "vm-new", "provider": "freestyle", "image": "cmux-devbox", "status": "running",
+            "createdAt": 1_000, "createdByUserId": "user-2",
+        ])
+        XCTAssertEqual(summary.createdBy, VMCreator(userId: "user-2"))
+    }
+
+    /// A REST read that started before a stream change lands after it: the
+    /// newer change must survive the older page instead of being undone.
+    func testStreamChangesDuringARestReadSurviveItsResult() {
+        let model = makeStreamingModel()
+        model.applyVMChanges(
+            upserts: [streamSummary("c", createdAt: 3_000), streamSummary("b", createdAt: 2_000), streamSummary("a", createdAt: 1_000)],
+            deletions: [], authoritative: true
+        )
+        model.beginRestReadStreamCapture()
+        model.applyVMChanges(upserts: [], deletions: ["b"], authoritative: false)
+        model.applyVMChanges(upserts: [streamSummary("a", status: "paused", createdAt: 1_000, label: "renamed")], deletions: [], authoritative: false)
+
+        let stalePage = VMListPage(vms: [streamSummary("c", createdAt: 3_000), streamSummary("b", createdAt: 2_000), streamSummary("a", createdAt: 1_000)])
+        model.applyRefreshResult(.success(stalePage), generation: model.refreshGeneration, scope: nil)
+
+        XCTAssertEqual(model.machines.map(\.id), ["c", "a"], "a delete newer than the read stays deleted")
+        XCTAssertEqual(model.machines[1].label, "renamed", "an update newer than the read stays applied")
+
+        // Outside a read, the REST page is the authority again.
+        model.applyRefreshResult(.success(stalePage), generation: model.refreshGeneration, scope: nil)
+        XCTAssertEqual(model.machines.map(\.id), ["c", "b", "a"])
+    }
+
+    func testRoutinePollIntervalFollowsTheStream() {
+        let clock = CloudReadManualClock()
+        let model = makeStreamingModel(pollingClock: clock)
+        XCTAssertEqual(model.routinePollInterval, MachinesPanelViewModel.pollInterval)
+        XCTAssertEqual(MachinesPanelViewModel.pollInterval, .seconds(45))
+        XCTAssertEqual(MachinesPanelViewModel.streamingPollInterval, .seconds(300))
+        XCTAssertFalse(model.isVMSyncConnected)
+        XCTAssertNil(model.vmSync, "no auth coordinator, no stream")
+        model.stopVMSync()
+        XCTAssertEqual(model.routinePollInterval, .seconds(45), "stopping an absent stream keeps the polling cadence")
+    }
 }

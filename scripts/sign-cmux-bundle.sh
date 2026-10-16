@@ -16,6 +16,14 @@
 #                              (default: TunnelExtension/cmuxTunnelExtension.<release|nightly|rc>.entitlements,
 #                              picked from the app entitlements file name)
 #   CMUX_TIMESTAMP             set to "none" for un-timestamped local sigs
+#   CMUX_SIGN_SKIP_NUCLEO_FFI  set to "1" for an app that embeds no command palette
+#                              Nucleo FFI (cmux NEXT DEV: cmux-next removed it)
+#   CMUX_SIGNING_KEYCHAIN_TOOL default scripts/ci/signing-keychain.sh. While it
+#                              reports a CI signing keychain, this script runs
+#                              no code from the bundle: it defers the diff
+#                              sidecar handshake, and the workflow runs
+#                              scripts/verify-diff-sidecar-artifact.sh again
+#                              after the keychain is deleted.
 #   CMUX_SIGN_MODE             "all" (default), "all-except-computer-use", or
 #                              "main-only". The split Computer Use notarization
 #                              flow uses all-except-computer-use while Apple's
@@ -25,6 +33,8 @@
 # Signs in the Apple-documented inside-out order:
 #   1. Helpers under Contents/Resources/bin/* and libexec/* with minimal
 #      hardened-runtime entitlements (no application-identifier).
+#      The macOS cmux-tui SSH payloads under Resources/bin/cmux-tui-ssh/ are
+#      signed the same way (scripts/sign-cmux-tui-ssh-payloads.sh).
 #   2. The nested cmux Computer Use app with the Developer ID identity.
 #   3. Each nested plugin under Contents/PlugIns/* with --deep.
 #   4. Each nested framework under Contents/Frameworks/* with --deep
@@ -54,6 +64,7 @@ APP_ENTITLEMENTS="$2"
 IDENTITY="$3"
 HELPER_ENTITLEMENTS="${CMUX_HELPER_ENTITLEMENTS:-cmux-helper.entitlements}"
 SIGN_MODE="${CMUX_SIGN_MODE:-all}"
+SIGNING_KEYCHAIN_TOOL="${CMUX_SIGNING_KEYCHAIN_TOOL:-$SCRIPT_DIR/ci/signing-keychain.sh}"
 
 if [[ ! -d "$APP_PATH" ]]; then
   echo "error: app bundle not found at $APP_PATH" >&2
@@ -74,6 +85,9 @@ case "$SIGN_MODE" in
     exit 2
     ;;
 esac
+
+# A long notarization wait can pass the CI keychain's short idle lock.
+"$SIGNING_KEYCHAIN_TOOL" unlock
 
 if [[ "${CMUX_TIMESTAMP:-}" == "none" ]]; then
   TS_FLAG=(--timestamp=none)
@@ -141,6 +155,9 @@ if [[ "$SIGN_MODE" == "all" || "$SIGN_MODE" == "all-except-computer-use" ]]; the
       /usr/bin/codesign "${COMMON[@]}" --entitlements "$HELPER_ENTITLEMENTS" "$helper"
     done
   done
+  # cmux-tui builds for SSH hosts. Notarization requires the macOS ones to be
+  # Developer ID signed; the script re-pins them in the bundled manifest.
+  "$SCRIPT_DIR/sign-cmux-tui-ssh-payloads.sh" "$APP_PATH" "$HELPER_ENTITLEMENTS" "$IDENTITY"
 
   # 2. Computer Use helper app. An early notarization submission owns this
   # signature in all-except-computer-use mode; changing it would invalidate the
@@ -202,13 +219,21 @@ echo "==> verifying"
 if [[ -d "$COMPUTER_USE_HELPER" ]]; then
   /usr/bin/codesign --verify --strict --verbose=2 "$COMPUTER_USE_HELPER"
 fi
-"$SCRIPT_DIR/verify-command-palette-nucleo-ffi-artifact.sh" "$APP_PATH"
+if [[ "${CMUX_SIGN_SKIP_NUCLEO_FFI:-}" != 1 ]]; then
+  "$SCRIPT_DIR/verify-command-palette-nucleo-ffi-artifact.sh" "$APP_PATH"
+fi
 # The sidecar must carry exactly the slices the app does: universal for stable
 # and the transitional nightly, one architecture for thinned nightlies.
+SIDECAR_CHECK=(--archs "$(lipo -archs "$APP_PATH/Contents/MacOS/cmux")" --require-signed)
+if "$SIGNING_KEYCHAIN_TOOL" is-present; then
+  # Run no bundle code while the signing identity is usable. The workflow
+  # repeats this check with the handshake after it deletes the keychain.
+  echo "==> CI signing keychain present: deferring the diff sidecar handshake"
+  SIDECAR_CHECK+=(--static-only)
+fi
 "$SCRIPT_DIR/verify-diff-sidecar-artifact.sh" \
   "$APP_PATH/Contents/Resources/bin/cmux-diff-sidecar" \
-  --archs "$(lipo -archs "$APP_PATH/Contents/MacOS/cmux")" \
-  --require-signed
+  "${SIDECAR_CHECK[@]}"
 
 APP_ID="$(/usr/libexec/PlistBuddy -c "Print :com.apple.application-identifier" \
   /dev/stdin <<<"$(plutil -convert xml1 -o - "$APP_ENTITLEMENTS")" 2>/dev/null || true)"

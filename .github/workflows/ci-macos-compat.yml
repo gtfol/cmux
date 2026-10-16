@@ -9,15 +9,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: macos-14
-            timeout: 60
-            run_unit_tests: false
-            run_mobile_transport_tests: true
-            startup_smoke: true
-            virtual_display: true
-            skip_zig: false
-            expected_arch: arm64
-            expected_os_major: "14"
           - os: macos-15-intel
             timeout: 90
             run_unit_tests: false
@@ -27,7 +18,7 @@ jobs:
             skip_zig: false
             expected_arch: x86_64
             expected_os_major: "15"
-          - os: ${{ vars.CI_PAID_MACOS_OVERFLOW == '1' && vars.MACOS_RUNNER_15 || 'blacksmith-6vcpu-macos-15' }}
+          - os: ${{ github.repository_owner != 'manaflow-ai' && 'macos-15' || (vars.CI_PAID_MACOS_OVERFLOW == '1' && vars.MACOS_RUNNER_15 || 'blacksmith-6vcpu-macos-15') }}
             timeout: 120
             run_unit_tests: false
             run_mobile_transport_tests: true
@@ -36,7 +27,7 @@ jobs:
             skip_zig: false
             expected_arch: ""
             expected_os_major: ""
-          - os: ${{ vars.MACOS_RUNNER_26 || 'blacksmith-6vcpu-macos-26' }}
+          - os: ${{ github.repository_owner != 'manaflow-ai' && 'macos-26' || vars.MACOS_RUNNER_26 || 'blacksmith-6vcpu-macos-26' }}
             timeout: 120
             run_unit_tests: false
             run_mobile_transport_tests: true
@@ -59,9 +50,9 @@ jobs:
           EXPECTED_OS_MAJOR: ${{ matrix.expected_os_major }}
         run: |
           set -euo pipefail
-          # Pick the latest Xcode installed on the runner. GitHub-hosted macos-14
-          # defaults to Xcode 15.4, but the project needs Xcode 16+ (Swift tools
-          # version 6.0 required by sentry-cocoa).
+          # Pick the latest Xcode installed on the runner. An image default can
+          # be older than the Xcode 16+ the project needs (Swift tools version
+          # 6.0 required by sentry-cocoa).
           XCODE_APP="$(
             find /Applications -maxdepth 1 -name 'Xcode*.app' -print 2>/dev/null \
               | sort \

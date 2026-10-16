@@ -277,6 +277,15 @@ extension TerminalController: ControlSurfaceContext {
 
     // MARK: - focus
 
+    func controlSurfaceJumpToLastPrompt() -> ControlSurfaceFocusResolution? {
+        guard let app = AppDelegate.shared, let target = app.jumpToLastPrompt() else { return nil }
+        return .focused(
+            windowID: v2ResolveWindowId(tabManager: app.tabManagerFor(tabId: target.workspaceId)),
+            workspaceID: target.workspaceId,
+            surfaceID: target.panelId
+        )
+    }
+
     func controlSurfaceFocus(
         routing: ControlRoutingSelectors,
         surfaceID: UUID
@@ -336,10 +345,8 @@ extension TerminalController: ControlSurfaceContext {
             _ = AppDelegate.shared?.focusMainWindow(windowId: windowId)
             setActiveTabManager(tabManager)
         }
-        if tabManager.selectedTabId != ws.id {
-            tabManager.selectWorkspace(ws)
-        }
-        ws.focusPanel(surfaceID)
+        // Record explicit intent before selection schedules focus restoration.
+        tabManager.focusTab(ws.id, surfaceId: surfaceID, suppressFlash: true)
         return .focused(
             windowID: v2ResolveWindowId(tabManager: tabManager),
             workspaceID: ws.id,

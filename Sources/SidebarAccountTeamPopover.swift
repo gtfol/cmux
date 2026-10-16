@@ -1,14 +1,10 @@
 import AppKit
+import CMUXMobileCore
 import CmuxAppKitSupportUI
 import CmuxSettingsUI
 import SwiftUI
 
-extension Notification.Name {
-    static let cmuxTeamPickerShortcutRequested = Notification.Name("cmux.teamPicker.shortcutRequested")
-}
-
-/// The existing compact sidebar account button with team management added to
-/// its account popover.
+/// The compact sidebar account button for account-level actions.
 struct SidebarAccountMenuButton: View {
     @EnvironmentObject private var tabManager: TabManager
     private var accountFlow: HostAccountFlow? { AppDelegate.shared?.auth?.accountFlow }
@@ -16,7 +12,6 @@ struct SidebarAccountMenuButton: View {
     private let signInTitle = String(localized: "settings.account.signIn", defaultValue: "Sign In…")
     private let buttonSize = SidebarFooterButtonMetrics.buttonSize
     @State private var isPopoverPresented = false
-    @State private var isShowingTeamPicker = false
     @State private var popoverGroup = CmuxPopoverGroup()
 #if DEBUG
     @AppStorage(SidebarFooterProfileIconDebugSettings.sizeKey)
@@ -100,33 +95,18 @@ struct SidebarAccountMenuButton: View {
         ) {
             SidebarAccountPopover(
                 accountFlow: accountFlow,
-                dismiss: { popoverGroup.dismissAll() },
-                isShowingTeamPicker: $isShowingTeamPicker,
-                popoverGroup: popoverGroup
+                dismiss: { popoverGroup.dismissAll() }
             )
         })
         .safeHelp(buttonTitle)
-        .accessibilityLabel(buttonTitle)
+        .hintableAccessibilityLabel(buttonTitle, isEnabled: accountFlow?.isWorkingOnAuth != true)
         .accessibilityIdentifier("SidebarAccountMenuButton")
-        .task {
-            for await _ in NotificationCenter.default.notifications(named: .cmuxTeamPickerShortcutRequested) {
-                guard !Task.isCancelled else { return }
-                isPopoverPresented = true
-            }
-        }
-        .onChange(of: isPopoverPresented) { _, presented in
-            if !presented {
-                isShowingTeamPicker = false
-            }
-        }
     }
 }
 
 private struct SidebarAccountPopover: View {
     let accountFlow: HostAccountFlow?
     let dismiss: () -> Void
-    @Binding var isShowingTeamPicker: Bool
-    let popoverGroup: CmuxPopoverGroup
     @State private var shortcutObserver = KeyboardShortcutSettingsObserver.shared
 
     private var settingsShortcutHint: String {
@@ -157,15 +137,6 @@ private struct SidebarAccountPopover: View {
                         }
                     }
                 }
-                Divider()
-                    .padding(.vertical, 4)
-                if let accountFlow {
-                    SidebarAccountTeamPickerRow(
-                        accountFlow: accountFlow,
-                        isPresented: $isShowingTeamPicker,
-                        popoverGroup: popoverGroup
-                    )
-                }
                 settingsRow
             } else {
                 Text(String(localized: "settings.account.signedOut.title", defaultValue: "Not signed in"))
@@ -182,13 +153,13 @@ private struct SidebarAccountPopover: View {
                 }
                 .accessibilityIdentifier("SidebarAccountSignInButton")
             }
-            if accountFlow?.isProUpgradeAvailable == true {
+            if let offer = accountFlow?.upgradeOffer {
                 if accountFlow?.currentIdentity == nil {
                     Divider()
                         .padding(.vertical, 4)
                 }
                 accountMenuRow(
-                    title: String(localized: "menu.help.upgradeToPro", defaultValue: "Upgrade to cmux Pro…"),
+                    title: ProUpgradePresenter.upgradeMenuTitle(for: offer),
                     systemImage: "sparkles"
                 ) {
                     dismiss()
@@ -197,6 +168,16 @@ private struct SidebarAccountPopover: View {
                 .accessibilityIdentifier("SidebarAccountUpgradeButton")
             }
             if accountFlow?.currentIdentity != nil {
+                // Same as the Cloud team menu: the browser opens on the sign-in
+                // page's account chooser, and the app follows whichever is picked.
+                accountMenuRow(
+                    title: String(localized: "cloud.teamPicker.switchAccount", defaultValue: "Switch Account…"),
+                    systemImage: "person.2"
+                ) {
+                    dismiss()
+                    Task { await accountFlow?.switchAccount() }
+                }
+                .accessibilityIdentifier("SidebarAccountSwitchAccountButton")
                 accountMenuRow(
                     title: String(localized: "settings.account.signOut", defaultValue: "Sign Out"),
                     systemImage: "rectangle.portrait.and.arrow.right"

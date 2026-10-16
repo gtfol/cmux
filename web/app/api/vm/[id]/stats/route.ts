@@ -6,6 +6,7 @@ import {
 import { setSpanAttributes } from "../../../../../services/telemetry";
 import { runVmRoute } from "../../../../../services/vms/routeWorkflow";
 import { getVmStats } from "../../../../../services/vms/workflows";
+import { vmModelPlaneRevoker } from "../../../../../services/vms/modelPlaneGateway";
 
 // Live CPU / memory / disk for one machine. Sleeping machines answer `asleep`
 // without being woken.
@@ -28,7 +29,8 @@ export async function GET(
         billingTeamId: account.entitlements.billingTeamId,
         teamIds: user.teamIds,
         providerVmId: id,
-      }), { request });
+        modelPlane: vmModelPlaneRevoker(),
+      }), { request, readDeadline: { operation: "stats" } });
       if (!run.ok) return run.response;
       return jsonResponse(run.value);
     },
