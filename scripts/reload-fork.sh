@@ -89,6 +89,25 @@ if [[ "$FORK_APP_NAME" != "cmux" ]]; then
   /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName $FORK_APP_NAME" "$APP/Contents/Info.plist"
 fi
 
+# cmux ssh bootstraps the remote host with a cmuxd-remote binary that the app
+# looks up through an embedded manifest. A plain xcodebuild has neither the
+# manifest nor the binaries, so bootstrap fails with "This cmux build has no
+# remote daemon for the remote host's platform". Build, embed and bundle them
+# before re-signing, since both edit the bundle.
+APP_VERSION="$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$APP/Contents/Info.plist")"
+DAEMON_ASSETS_DIR="$DERIVED_DATA/remote-daemon-assets"
+./scripts/build_remote_daemon_release_assets.sh \
+  --version "$APP_VERSION" \
+  --release-tag "v${APP_VERSION}" \
+  --repo "manaflow-ai/cmux" \
+  --output-dir "$DAEMON_ASSETS_DIR"
+python3 ./scripts/verify_remote_daemon_release.py \
+  --manifest "$DAEMON_ASSETS_DIR/cmuxd-remote-manifest.json" \
+  --assets-dir "$DAEMON_ASSETS_DIR" \
+  --app "$APP" \
+  --embed \
+  --bundle-assets
+
 # The global CODE_SIGN_ENTITLEMENTS override also lands on the CLI helpers under
 # Resources/bin. A standalone binary can't satisfy restricted entitlements
 # (keychain-access-groups, get-task-allow) via the app's provisioning profile,

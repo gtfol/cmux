@@ -492,6 +492,8 @@ bundle ID. A new bundle ID starts with fresh settings and pairing.
 - Rust 1.88. Crates without a `rust-toolchain.toml` (for example `cmux-cua`)
   use the rustup default, so either `rustup default 1.88.0` or prefix builds
   with `RUSTUP_TOOLCHAIN=1.88.0`.
+- `go` (`brew install go`), to build the bundled `cmuxd-remote` binaries
+  that `cmux ssh` installs on remote hosts.
 - Submodules and GhosttyKit:
   `git submodule update --init --recursive && ./scripts/download-prebuilt-ghosttykit.sh`
   (or the full `./scripts/setup.sh`).
