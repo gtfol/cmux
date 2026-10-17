@@ -458,7 +458,7 @@ We want to hear it. Open an [issue](https://github.com/manaflow-ai/cmux/issues) 
 
 ## Fork development
 
-This is a personal fork (`allenlinsh/cmux`). Local **Release** builds must use
+This is a fork (`gtfol/cmux`). Local **Release** builds must use
 `scripts/reload-fork.sh` — **not** `scripts/reloadp.sh`. `reloadp.sh` builds under
 `com.cmuxterm.*`, which is registered to Manaflow's Apple team, so it fails to
 sign in a fork.
