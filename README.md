@@ -536,6 +536,27 @@ launch anywhere else until that Mac is in the profile:
    build is not notarized, so Gatekeeper blocks it otherwise):
    `xattr -dr com.apple.quarantine "/Applications/cmux fork.app"`
 
+### Publishing a release
+
+`./scripts/release-fork.sh` builds the app, signs it with Developer ID, notarizes
+it and publishes a universal (Apple silicon and Intel) DMG to this repo's GitHub
+releases. Anyone can install it without registering their Mac or clearing
+quarantine. Published apps update themselves from this repo's releases, not
+upstream's. One-time setup:
+
+1. A **Developer ID Application** certificate for the team (Xcode → Settings →
+   Accounts → Manage Certificates → +). Only the team's Account Holder can create it.
+2. An explicit App ID for `FORK_BUNDLE_ID` and a **Developer ID** provisioning
+   profile for it (Certificates, IDs & Profiles → Profiles → + → Developer ID).
+   Download it and set `FORK_DEVID_PROFILE=/path/to/profile.provisionprofile`
+   in `.fork-config`.
+3. Notarization credentials, using an app-specific password from account.apple.com:
+   `xcrun notarytool store-credentials cmux-fork-notary --apple-id <apple-id> --team-id <team-id>`
+
+The first run creates a Sparkle update-signing key in your login keychain. Keep
+it: later releases must be signed with the same key, or installed apps reject
+their updates. Use `--no-publish` to stop after notarizing and inspect the DMG.
+
 ### iOS (physical device)
 
 Same `.fork-config` and prerequisites, then with the iPhone plugged in and
