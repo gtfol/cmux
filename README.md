@@ -494,6 +494,9 @@ bundle ID. A new bundle ID starts with fresh settings and pairing.
   with `RUSTUP_TOOLCHAIN=1.88.0`.
 - `go` (`brew install go`), to build the bundled `cmuxd-remote` binaries
   that `cmux ssh` installs on remote hosts.
+- An authenticated `gh` (`gh auth login`), so the build can verify the published
+  `cmux-tui` client that `cmux ssh` runs through. Without it the client is
+  installed unattested.
 - Submodules and GhosttyKit:
   `git submodule update --init --recursive && ./scripts/download-prebuilt-ghosttykit.sh`
   (or the full `./scripts/setup.sh`).

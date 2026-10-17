@@ -108,6 +108,23 @@ python3 ./scripts/verify_remote_daemon_release.py \
   --embed \
   --bundle-assets
 
+# cmux ssh runs through the bundled cmux-tui client (Contents/Resources/bin/cmux-tui).
+# Without it every cmux ssh fails with the generic "The Cloud VM request failed"
+# error. Install the published client for this checkout, as release.yml does.
+CMUX_TUI_COMMIT="$(./scripts/ci/resolve-cmux-tui-client-commit.sh)"
+CMUX_TUI_INSTALL_ARGS=(
+  "$APP"
+  --manifest-url "https://files.cmux.com/cmux-tui/${CMUX_TUI_COMMIT}/manifest.json"
+  --expected-commit "$CMUX_TUI_COMMIT"
+  --require-capability wireguard-hub
+)
+# The installer verifies the manifest's build-provenance attestation through gh;
+# without an authenticated gh it can only install unattested.
+if ! command -v gh >/dev/null 2>&1 || ! gh auth token >/dev/null 2>&1; then
+  CMUX_TUI_INSTALL_ARGS+=(--allow-unattested)
+fi
+./scripts/install-cmux-tui-client.sh "${CMUX_TUI_INSTALL_ARGS[@]}"
+
 # The global CODE_SIGN_ENTITLEMENTS override also lands on the CLI helpers under
 # Resources/bin. A standalone binary can't satisfy restricted entitlements
 # (keychain-access-groups, get-task-allow) via the app's provisioning profile,
